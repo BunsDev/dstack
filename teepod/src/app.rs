@@ -122,20 +122,23 @@ impl App {
         };
         let started = vm_work_dir.started().context("Failed to read VM state")?;
         if started {
-            self.start_vm(&vm_id).await?;
+            self.start_vm(&vm_id).await.context("Failed to start VM")?;
         }
 
         Ok(())
     }
 
     pub async fn start_vm(&self, id: &str) -> Result<()> {
-        self.sync_dynamic_config(id)?;
+        self.sync_dynamic_config(id)
+            .context("Failed to sync dynamic config")?;
         let is_running = self
             .supervisor
             .info(id)
-            .await?
+            .await
+            .context("Failed to get VM info")?
             .is_some_and(|info| info.state.status.is_running());
-        self.set_started(id, true)?;
+        self.set_started(id, true)
+            .context("Failed to set started")?;
         let vm_config = {
             let mut state = self.lock();
             let vm_state = state.get_mut(id).context("VM not found")?;
@@ -151,10 +154,12 @@ impl App {
             let work_dir = self.work_dir(id);
             for path in [work_dir.serial_pty(), work_dir.qmp_socket()] {
                 if path.exists() {
-                    fs::remove_file(path)?;
+                    fs::remove_file(path).context("Failed to remove path")?;
                 }
             }
-            let process_config = vm_config.config_qemu(&work_dir, &self.config.cvm)?;
+            let process_config = vm_config
+                .config_qemu(&work_dir, &self.config.cvm)
+                .context("Failed to config qemu")?;
             self.supervisor
                 .deploy(process_config)
                 .await

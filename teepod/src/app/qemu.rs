@@ -65,7 +65,7 @@ fn create_hd(
     }
     command.arg(image_file.as_ref());
     command.arg(size);
-    let output = command.output()?;
+    let output = command.output().context("Failed to run qemu-img")?;
     if !output.status.success() {
         bail!(
             "Failed to create disk: {}",
@@ -175,10 +175,11 @@ impl VmConfig {
         let disk_size = format!("{}G", self.manifest.disk_size);
         let hda_path = workdir.hda_path();
         if !hda_path.exists() {
-            create_hd(&hda_path, self.image.hda.as_ref(), &disk_size)?;
+            create_hd(&hda_path, self.image.hda.as_ref(), &disk_size)
+                .context("Failed to create HD")?;
         }
         if !shared_dir.exists() {
-            fs::create_dir_all(&shared_dir)?;
+            fs::create_dir_all(&shared_dir).context("Failed to create shared dir")?;
         }
         let qemu = &cfg.qemu_path;
         let mut command = Command::new(qemu);
