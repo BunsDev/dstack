@@ -11,11 +11,7 @@ services:
             cd dstack && \
             git checkout ${GIT_REV}
         WORKDIR /app/dstack/kms/auth-eth
-        RUN npm install && \
-            npm cache clean --force && \
-            npx hardhat clean && \
-            npx hardhat compile --verbose && \
-            npx hardhat typechain
+        RUN npm install
         RUN npx tsc --project tsconfig.json
         CMD node dist/src/main.js
     environment:
