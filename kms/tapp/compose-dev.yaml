@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile_inline: |
-        FROM node:18-alpine@sha256:06f7bbbcec00dd10c21a3a0962609600159601b5004d84aff142977b449168e9
+        FROM node:23
         WORKDIR /app
 
         RUN apk add --no-cache git
@@ -14,7 +14,7 @@ services:
         RUN npm install && \
             npm cache clean --force && \
             npx hardhat clean && \
-            npx hardhat compile --force && \
+            npx hardhat compile --verbose && \
             npx hardhat typechain
         RUN npx tsc --project tsconfig.json
         CMD node dist/src/main.js
