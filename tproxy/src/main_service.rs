@@ -152,15 +152,18 @@ impl ProxyState {
     }
 
     pub(crate) fn reconfigure(&mut self) -> Result<()> {
-        let wg_config = self.generate_wg_config()?;
-        safe_write(&self.config.wg.config_path, wg_config).context("Failed to write wg config")?;
-        // wg setconf <interface_name> <config_path>
-        let ifname = &self.config.wg.interface;
-        let config_path = &self.config.wg.config_path;
+        if self.config.wg.enabled {
+            let wg_config = self.generate_wg_config()?;
+            safe_write(&self.config.wg.config_path, wg_config)
+                .context("Failed to write wg config")?;
+            // wg setconf <interface_name> <config_path>
+            let ifname = &self.config.wg.interface;
+            let config_path = &self.config.wg.config_path;
 
-        match cmd!(wg syncconf $ifname $config_path) {
-            Ok(_) => info!("wg config updated"),
-            Err(e) => error!("failed to set wg config: {e}"),
+            match cmd!(wg syncconf $ifname $config_path) {
+                Ok(_) => info!("wg config updated"),
+                Err(e) => error!("failed to set wg config: {e}"),
+            }
         }
         let state_str = serde_json::to_string(&self.state).context("Failed to serialize state")?;
         safe_write(&self.config.state_path, state_str).context("Failed to write state")?;
@@ -168,6 +171,9 @@ impl ProxyState {
     }
 
     pub(crate) fn select_top_n_hosts(&mut self, id: &str) -> Result<AddressGroup> {
+        if self.config.proxy.localhost_enabled && id == "localhost" {
+            return Ok(smallvec![Ipv4Addr::new(127, 0, 0, 1)]);
+        }
         let n = self.config.proxy.connect_top_n;
         if let Some(instance) = self.state.instances.get(id) {
             return Ok(smallvec![instance.ip]);

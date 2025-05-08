@@ -10,6 +10,7 @@ use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WgConfig {
+    pub enabled: bool,
     pub public_key: String,
     pub private_key: String,
     pub listen_port: u16,
@@ -31,6 +32,7 @@ pub struct ProxyConfig {
     pub timeouts: Timeouts,
     pub buffer_size: usize,
     pub connect_top_n: usize,
+    pub localhost_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,6 +140,10 @@ pub fn load_config_figment(config_file: Option<&str>) -> Figment {
 }
 
 pub fn setup_wireguard(config: &WgConfig) -> Result<()> {
+    if !config.enabled {
+        info!("WireGuard is disabled");
+        return Ok(());
+    }
     info!("Setting up wireguard interface");
 
     let ifname = &config.interface;
