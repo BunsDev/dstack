@@ -112,13 +112,41 @@ function reply_rtmrs(event_log: EventLog[]): Record<number, string> {
 }
 
 
-export function send_rpc_request<T = any>(endpoint: string, path: string, payload: string): Promise<T> {
+export function send_rpc_request<T = any>(endpoint: string, path: string, payload: string, timeoutMs?: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const abortController = new AbortController()
+    let isCompleted = false
+    
+    const safeReject = (error: Error) => {
+      if (!isCompleted) {
+        isCompleted = true
+        reject(error)
+      }
+    }
+    
+    const safeResolve = (result: T) => {
+      if (!isCompleted) {
+        isCompleted = true
+        resolve(result)
+      }
+    }
+    
     const timeout = setTimeout(() => {
       abortController.abort()
-      reject(new Error('Request timed out'))
-    }, 30_000) // 30 seconds timeout
+      safeReject(new Error('request timed out'))
+    }, timeoutMs || 30_000) // Default 30 seconds timeout
+
+    const cleanup = () => {
+      clearTimeout(timeout)
+      abortController.signal.removeEventListener('abort', onAbort)
+    }
+
+    const onAbort = () => {
+      cleanup()
+      safeReject(new Error('request aborted'))
+    }
+
+    abortController.signal.addEventListener('abort', onAbort)
 
     const isHttp = endpoint.startsWith('http://') || endpoint.startsWith('https://')
 
@@ -139,24 +167,23 @@ export function send_rpc_request<T = any>(endpoint: string, path: string, payloa
           data += chunk
         })
         res.on('end', () => {
-          clearTimeout(timeout)
+          cleanup()
           try {
             const result = JSON.parse(data)
-            resolve(result as T)
+            safeResolve(result as T)
           } catch (error) {
-            reject(new Error('Failed to parse response'))
+            safeReject(new Error('failed to parse response'))
           }
         })
       })
 
       req.on('error', (error) => {
-        clearTimeout(timeout)
-        reject(error)
+        cleanup()
+        safeReject(error)
       })
 
       abortController.signal.addEventListener('abort', () => {
         req.destroy()
-        reject(new Error('Request aborted'))
       })
 
       req.write(payload)
@@ -203,23 +230,22 @@ export function send_rpc_request<T = any>(endpoint: string, path: string, payloa
       })
 
       client.on('end', () => {
-        clearTimeout(timeout)
+        cleanup()
         try {
           const result = JSON.parse(bodyData.slice(0, contentLength))
-          resolve(result as T)
+          safeResolve(result as T)
         } catch (error) {
-          reject(new Error('Failed to parse response'))
+          safeReject(new Error('failed to parse response'))
         }
       })
 
       client.on('error', (error) => {
-        clearTimeout(timeout)
-        reject(error)
+        cleanup()
+        safeReject(error)
       })
 
       abortController.signal.addEventListener('abort', () => {
         client.destroy()
-        reject(new Error('Request aborted'))
       })
     }
   })
@@ -281,5 +307,15 @@ export class TappdClient {
       ...result,
       tcb_info: JSON.parse(result.tcb_info) as TcbInfo,
     })
+  }
+
+  async isReachable(): Promise<boolean> {
+    try {
+      // Use info endpoint to test connectivity with 500ms timeout
+      await send_rpc_request(this.endpoint, '/prpc/Tappd.Info', '{}', 500)
+      return true
+    } catch (error) {
+      return false
+    }
   }
 }
