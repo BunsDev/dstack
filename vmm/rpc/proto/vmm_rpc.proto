@@ -82,7 +82,7 @@ message VmConfiguration {
 message GpuConfig {
   // GPUs
   repeated GpuSpec gpus = 1;
-  // Gpu attach mode
+  // Gpu attach mode, "listed" or "all"
   string attach_mode = 2;
 }
 
