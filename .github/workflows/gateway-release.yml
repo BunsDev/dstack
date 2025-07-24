@@ -1,10 +1,10 @@
-name: KMS Release
+name: Gateway Release
 
 on:
   workflow_dispatch:
   push:
     tags:
-      - 'kms-v*'
+      - 'gateway-v*'
 permissions:
   attestations: write
   id-token: write
@@ -20,8 +20,8 @@ jobs:
 
       - name: Parse version from tag
         run: |
-          # Extract version from tag (e.g., kms-v1.2.3 -> 1.2.3)
-          VERSION=${GITHUB_REF#refs/tags/kms-v}
+          # Extract version from tag (e.g., gateway-v1.2.3 -> 1.2.3)
+          VERSION=${GITHUB_REF#refs/tags/gateway-v}
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "Parsed version: $VERSION"
 
@@ -34,9 +34,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Write GIT_REV
-        run: git rev-parse HEAD > kms/dstack-app/builder/.GIT_REV
-
       - name: Get Git commit timestamps
         run: |
           echo "TIMESTAMP=$(git log -1 --pretty=%ct)" >> $GITHUB_ENV
@@ -48,31 +45,31 @@ jobs:
         env:
           SOURCE_DATE_EPOCH: ${{ env.TIMESTAMP }}
         with:
-          context: kms/dstack-app/builder
+          context: gateway/dstack-app/builder
           push: true
-          tags: ${{ vars.DOCKERHUB_USERNAME }}/kms:${{ env.VERSION }}
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/gateway:${{ env.VERSION }}
           platforms: linux/amd64
           build-args: |
             DSTACK_REV=${{ env.GIT_REV }}
             SOURCE_DATE_EPOCH=${{ env.TIMESTAMP }}
           outputs: |
-            type=docker,name=${{ vars.DOCKERHUB_USERNAME }}/kms:${{ env.VERSION }},rewrite-timestamp=true
+            type=docker,name=${{ vars.DOCKERHUB_USERNAME }}/gateway:${{ env.VERSION }},rewrite-timestamp=true
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
         with:
-          subject-name: "docker.io/${{ vars.DOCKERHUB_USERNAME }}/kms"
+          subject-name: "docker.io/${{ vars.DOCKERHUB_USERNAME }}/gateway"
           subject-digest: ${{ steps.build-and-push.outputs.digest }}
           push-to-registry: true
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          name: "KMS Release v${{ env.VERSION }}"
+          name: "Gateway Release v${{ env.VERSION }}"
           body: |
             ## Docker Image Information
 
-            **Image**: `docker.io/${{ vars.DOCKERHUB_USERNAME }}/kms:${{ env.VERSION }}`
+            **Image**: `docker.io/${{ vars.DOCKERHUB_USERNAME }}/gateway:${{ env.VERSION }}`
 
             **Digest (SHA256)**: `${{ steps.build-and-push.outputs.digest }}`
 
