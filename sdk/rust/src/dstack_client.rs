@@ -36,6 +36,36 @@ fn get_endpoint(endpoint: Option<&str>) -> String {
     "/var/run/dstack.sock".to_string()
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApiVersion {
+    V03x, // Legacy Tappd API (0.3.x)
+    V05x, // Current API (0.5.x)
+}
+
+impl ApiVersion {
+    fn detect_from_endpoint(endpoint: &str) -> Self {
+        // If endpoint mentions tappd, it's likely the legacy version
+        if endpoint.contains("tappd") {
+            return ApiVersion::V03x;
+        }
+        
+        // Check for legacy socket path
+        if endpoint == "/var/run/tappd.sock" {
+            return ApiVersion::V03x;
+        }
+        
+        // Default to current version for new socket path or HTTP endpoints
+        ApiVersion::V05x
+    }
+    
+    fn get_socket_path(&self) -> &'static str {
+        match self {
+            ApiVersion::V03x => "/var/run/tappd.sock",
+            ApiVersion::V05x => "/var/run/dstack.sock",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ClientKind {
     Http,
@@ -86,6 +116,24 @@ pub struct GetKeyResponse {
     pub signature_chain: Vec<String>,
 }
 
+/// Legacy response structure for the 0.3.x API
+#[derive(Serialize, Deserialize)]
+pub struct LegacyGetKeyResponse {
+    /// The key in hexadecimal format (legacy field name)
+    pub k256_key: String,
+    /// The chain of signatures verifying the key (legacy field name)
+    pub k256_signature_chain: Vec<String>,
+}
+
+impl From<LegacyGetKeyResponse> for GetKeyResponse {
+    fn from(legacy: LegacyGetKeyResponse) -> Self {
+        GetKeyResponse {
+            key: legacy.k256_key,
+            signature_chain: legacy.k256_signature_chain,
+        }
+    }
+}
+
 impl GetKeyResponse {
     pub fn decode_key(&self) -> Result<Vec<u8>, FromHexError> {
         hex::decode(&self.key)
@@ -97,7 +145,7 @@ impl GetKeyResponse {
 }
 
 /// Response containing a quote and associated event log
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct GetQuoteResponse {
     /// The attestation quote in hexadecimal format
     pub quote: String,
@@ -210,13 +258,79 @@ pub struct DstackClient {
     endpoint: String,
     /// The type of client (HTTP or Unix domain socket)
     client: ClientKind,
+    /// The API version being used
+    api_version: ApiVersion,
 }
 
 impl BaseClient for DstackClient {}
 
 impl DstackClient {
+    /// Attempts to detect the API version by checking if the service responds to a simple request
+    pub async fn detect_version(endpoint: Option<&str>) -> Result<ApiVersion> {
+        // Try with 0.5.x API first (newer)
+        let client_v5 = DstackClient::new_with_version(endpoint, ApiVersion::V05x);
+        if client_v5.test_connection().await.is_ok() {
+            return Ok(ApiVersion::V05x);
+        }
+        
+        // Fall back to 0.3.x API
+        let client_v3 = DstackClient::new_with_version(endpoint, ApiVersion::V03x);
+        if client_v3.test_connection().await.is_ok() {
+            return Ok(ApiVersion::V03x);
+        }
+        
+        // If neither works, default to 0.5.x
+        Ok(ApiVersion::V05x)
+    }
+    
+    /// Test connection to the service
+    async fn test_connection(&self) -> Result<()> {
+        // Try to call info endpoint - it exists in both APIs
+        self.info().await.map(|_| ())
+    }
+    
+    /// Get the current API version being used
+    pub fn api_version(&self) -> &ApiVersion {
+        &self.api_version
+    }
+    
+    /// Check if a feature is supported in the current API version
+    pub fn supports_emit_event(&self) -> bool {
+        matches!(self.api_version, ApiVersion::V05x)
+    }
+    
     pub fn new(endpoint: Option<&str>) -> Self {
         let endpoint = get_endpoint(endpoint);
+        let api_version = ApiVersion::detect_from_endpoint(&endpoint);
+        
+        // If no explicit endpoint provided, use the socket path based on detected/default version
+        let final_endpoint = if endpoint == "/var/run/dstack.sock" && api_version == ApiVersion::V03x {
+            api_version.get_socket_path().to_string()
+        } else if endpoint.starts_with("/var/run/") && !endpoint.contains("http") {
+            // For socket paths, ensure we use the correct one for the version
+            api_version.get_socket_path().to_string()
+        } else {
+            endpoint
+        };
+        
+        let (base_url, client) = match final_endpoint {
+            ref e if e.starts_with("http://") || e.starts_with("https://") => {
+                (e.to_string(), ClientKind::Http)
+            }
+            _ => ("http://localhost".to_string(), ClientKind::Unix),
+        };
+
+        DstackClient {
+            base_url,
+            endpoint: final_endpoint,
+            client,
+            api_version,
+        }
+    }
+    
+    pub fn new_with_version(endpoint: Option<&str>, version: ApiVersion) -> Self {
+        let endpoint = endpoint.map(|e| e.to_string()).unwrap_or_else(|| version.get_socket_path().to_string());
+        
         let (base_url, client) = match endpoint {
             ref e if e.starts_with("http://") || e.starts_with("https://") => {
                 (e.to_string(), ClientKind::Http)
@@ -228,6 +342,7 @@ impl DstackClient {
             base_url,
             endpoint,
             client,
+            api_version: version,
         }
     }
 
@@ -273,47 +388,116 @@ impl DstackClient {
         path: Option<String>,
         purpose: Option<String>,
     ) -> Result<GetKeyResponse> {
-        let data = json!({
-            "path": path.unwrap_or_default(),
-            "purpose": purpose.unwrap_or_default(),
-        });
-        let response = self.send_rpc_request("/GetKey", &data).await?;
-        let response = serde_json::from_value::<GetKeyResponse>(response)?;
-
-        Ok(response)
+        match self.api_version {
+            ApiVersion::V05x => {
+                let data = json!({
+                    "path": path.unwrap_or_default(),
+                    "purpose": purpose.unwrap_or_default(),
+                });
+                let response = self.send_rpc_request("/GetKey", &data).await?;
+                let response = serde_json::from_value::<GetKeyResponse>(response)?;
+                Ok(response)
+            },
+            ApiVersion::V03x => {
+                let data = json!({
+                    "path": path.unwrap_or_default(),
+                    "purpose": purpose.unwrap_or_default(),
+                });
+                let response = self.send_rpc_request("/prpc/Tappd.DeriveK256Key", &data).await?;
+                let legacy_response = serde_json::from_value::<LegacyGetKeyResponse>(response)?;
+                Ok(legacy_response.into())
+            }
+        }
     }
 
     pub async fn get_quote(&self, report_data: Vec<u8>) -> Result<GetQuoteResponse> {
         if report_data.is_empty() || report_data.len() > 64 {
             anyhow::bail!("Invalid report data length")
         }
-        let hex_data = hex_encode(report_data);
-        let data = json!({ "report_data": hex_data });
-        let response = self.send_rpc_request("/GetQuote", &data).await?;
-        let response = serde_json::from_value::<GetQuoteResponse>(response)?;
-
-        Ok(response)
+        let hex_data = hex_encode(&report_data);
+        
+        match self.api_version {
+            ApiVersion::V05x => {
+                let data = json!({ "report_data": hex_data });
+                let response = self.send_rpc_request("/GetQuote", &data).await?;
+                let response = serde_json::from_value::<GetQuoteResponse>(response)?;
+                Ok(response)
+            },
+            ApiVersion::V03x => {
+                // For legacy API, use RawQuote if exactly 64 bytes, otherwise TdxQuote with raw hash
+                let data = if report_data.len() == 64 {
+                    json!({ "report_data": hex_data })
+                } else {
+                    json!({ 
+                        "report_data": hex_data,
+                        "hash_algorithm": "raw",
+                        "prefix": ""
+                    })
+                };
+                
+                let endpoint = if report_data.len() == 64 {
+                    "/prpc/Tappd.RawQuote"
+                } else {
+                    "/prpc/Tappd.TdxQuote"
+                };
+                
+                let response = self.send_rpc_request(endpoint, &data).await?;
+                let response = serde_json::from_value::<GetQuoteResponse>(response)?;
+                Ok(response)
+            }
+        }
     }
 
     pub async fn info(&self) -> Result<InfoResponse> {
-        let response = self.send_rpc_request("/Info", &json!({})).await?;
+        let endpoint = match self.api_version {
+            ApiVersion::V05x => "/Info",
+            ApiVersion::V03x => "/prpc/Tappd.Info",
+        };
+        
+        let response = self.send_rpc_request(endpoint, &json!({})).await?;
         Ok(InfoResponse::validated_from_value(response)?)
     }
 
     pub async fn emit_event(&self, event: String, payload: Vec<u8>) -> Result<()> {
-        if event.is_empty() {
-            anyhow::bail!("Event name cannot be empty")
+        match self.api_version {
+            ApiVersion::V05x => {
+                if event.is_empty() {
+                    anyhow::bail!("Event name cannot be empty")
+                }
+                let hex_payload = hex_encode(payload);
+                let data = json!({ "event": event, "payload": hex_payload });
+                self.send_rpc_request::<_, ()>("/EmitEvent", &data).await?;
+                Ok(())
+            },
+            ApiVersion::V03x => {
+                anyhow::bail!("EmitEvent is not supported in API version 0.3.x. Please upgrade to dstack 0.5.0 or later.")
+            }
         }
-        let hex_payload = hex_encode(payload);
-        let data = json!({ "event": event, "payload": hex_payload });
-        self.send_rpc_request::<_, ()>("/EmitEvent", &data).await?;
-        Ok(())
     }
 
     pub async fn get_tls_key(&self, tls_key_config: TlsKeyConfig) -> Result<GetTlsKeyResponse> {
-        let response = self.send_rpc_request("/GetTlsKey", &tls_key_config).await?;
-        let response = serde_json::from_value::<GetTlsKeyResponse>(response)?;
-
-        Ok(response)
+        match self.api_version {
+            ApiVersion::V05x => {
+                let response = self.send_rpc_request("/GetTlsKey", &tls_key_config).await?;
+                let response = serde_json::from_value::<GetTlsKeyResponse>(response)?;
+                Ok(response)
+            },
+            ApiVersion::V03x => {
+                // For legacy API, we need to map to DeriveKey with additional fields
+                let data = json!({
+                    "path": "",  // Default empty path for TLS keys
+                    "subject": tls_key_config.subject,
+                    "alt_names": tls_key_config.alt_names,
+                    "usage_ra_tls": tls_key_config.usage_ra_tls,
+                    "usage_server_auth": tls_key_config.usage_server_auth,
+                    "usage_client_auth": tls_key_config.usage_client_auth,
+                    "random_seed": false
+                });
+                
+                let response = self.send_rpc_request("/prpc/Tappd.DeriveKey", &data).await?;
+                let response = serde_json::from_value::<GetTlsKeyResponse>(response)?;
+                Ok(response)
+            }
+        }
     }
 }

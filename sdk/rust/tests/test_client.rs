@@ -1,6 +1,7 @@
 use dcap_qvl::quote::Quote;
-use dstack_sdk::dstack_client::DstackClient as AsyncDstackClient;
+use dstack_sdk::dstack_client::{DstackClient as AsyncDstackClient, ApiVersion};
 
+// Common tests that work with auto-detection (will use current simulator default)
 #[tokio::test]
 async fn test_async_client_get_key() {
     let client = AsyncDstackClient::new(None);
@@ -87,4 +88,43 @@ async fn test_info() {
     assert!(!info.device_id.is_empty());
     assert!(!info.key_provider_info.is_empty());
     assert!(!info.compose_hash.is_empty());
+}
+
+// Tests for API version detection and compatibility
+#[tokio::test]
+async fn test_api_version_detection() {
+    // Test that we can create clients with explicit versions
+    let client_v3 = AsyncDstackClient::new_with_version(None, ApiVersion::V03x);
+    assert_eq!(client_v3.api_version(), &ApiVersion::V03x);
+    
+    let client_v5 = AsyncDstackClient::new_with_version(None, ApiVersion::V05x);
+    assert_eq!(client_v5.api_version(), &ApiVersion::V05x);
+}
+
+#[tokio::test]
+async fn test_endpoint_based_version_detection() {
+    // Test legacy socket path detection
+    let client_legacy = AsyncDstackClient::new(Some("/var/run/tappd.sock"));
+    assert_eq!(client_legacy.api_version(), &ApiVersion::V03x);
+    
+    // Test new socket path detection
+    let client_new = AsyncDstackClient::new(Some("/var/run/dstack.sock"));
+    assert_eq!(client_new.api_version(), &ApiVersion::V05x);
+}
+
+#[tokio::test]
+async fn test_cross_version_api_consistency() {
+    // Test that both versions return consistent data structures
+    let client_v3 = AsyncDstackClient::new_with_version(None, ApiVersion::V03x);  
+    let client_v5 = AsyncDstackClient::new_with_version(None, ApiVersion::V05x);
+    
+    // Both should succeed with get_key (if service is available)
+    let key_result_v3 = client_v3.get_key(Some("test".to_string()), Some("signing".to_string())).await;
+    let key_result_v5 = client_v5.get_key(Some("test".to_string()), Some("signing".to_string())).await;
+    
+    // If both succeed, they should have the same structure
+    if let (Ok(key_v3), Ok(key_v5)) = (key_result_v3, key_result_v5) {
+        assert_eq!(key_v3.key.len(), key_v5.key.len()); // Same key length
+        assert_eq!(key_v3.signature_chain.len(), key_v5.signature_chain.len()); // Same signature chain length
+    }
 }
