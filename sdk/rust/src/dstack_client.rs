@@ -191,16 +191,25 @@ pub struct InfoResponse {
     pub tcb_info: TcbInfo,
     /// The name of the application
     pub app_name: String,
-    /// The device identifier
+    /// The device identifier (may be missing in legacy responses)
+    #[serde(default)]
     pub device_id: String,
     /// The hash of the OS image
     /// Optional: empty if OS image is not measured by KMS
     #[serde(default)]
     pub os_image_hash: String,
-    /// Information about the key provider
+    /// Information about the key provider (may be missing in legacy responses)
+    #[serde(default)]
     pub key_provider_info: String,
-    /// The hash of the compose configuration
+    /// The hash of the compose configuration (may be missing in legacy responses)
+    #[serde(default)]
     pub compose_hash: String,
+    /// Public logs enabled (legacy field, may be missing in current responses)
+    #[serde(default)]
+    pub public_logs: bool,
+    /// Public system info enabled (legacy field, may be missing in current responses)
+    #[serde(default)]
+    pub public_sysinfo: bool,
 }
 
 impl InfoResponse {
@@ -229,14 +238,20 @@ pub struct TcbInfo {
     /// The hash of the OS image. This is empty if the OS image is not measured by KMS.
     #[serde(default)]
     pub os_image_hash: String,
-    /// The hash of the compose configuration
+    /// The hash of the compose configuration (may be missing in legacy responses)
+    #[serde(default)]
     pub compose_hash: String,
-    /// The device identifier
+    /// The device identifier (may be missing in legacy responses)  
+    #[serde(default)]
     pub device_id: String,
     /// The app compose
+    #[serde(default)]
     pub app_compose: String,
     /// The event log entries
     pub event_log: Vec<EventLog>,
+    /// Legacy rootfs hash field (only in legacy API)
+    #[serde(default)]
+    pub rootfs_hash: String,
 }
 
 /// Response containing TLS key and certificate chain
@@ -320,6 +335,7 @@ impl DstackClient {
             _ => ("http://localhost".to_string(), ClientKind::Unix),
         };
 
+        println!("final_endpoint: {final_endpoint}, version: {api_version:?}");
         DstackClient {
             base_url,
             endpoint: final_endpoint,
