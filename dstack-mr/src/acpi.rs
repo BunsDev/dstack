@@ -62,11 +62,26 @@ impl Machine<'_> {
             "tdx-guest,id=tdx",
             "-device",
             "vhost-vsock-pci,guest-cid=3",
-            "-virtfs",
-            &format!(
-                "local,path={shared_dir},mount_tag=host-shared,readonly=on,security_model=none,id=virtfs0",
-            ),
         ]);
+
+        // Configure shared files delivery: either via disk or 9p
+        if self.shared_disk_mode {
+            // Use a second virtual disk (hd2) to share files
+            cmd.args([
+                "-drive",
+                &format!("file={dummy_disk},if=none,id=hd2,format=raw,readonly=on"),
+                "-device",
+                "virtio-blk-pci,drive=hd2",
+            ]);
+        } else {
+            // Use 9p virtfs (default)
+            cmd.args([
+                "-virtfs",
+                &format!(
+                    "local,path={shared_dir},mount_tag=host-shared,readonly=on,security_model=none,id=virtfs0",
+                ),
+            ]);
+        }
 
         if self.root_verity {
             cmd.args([

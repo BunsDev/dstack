@@ -286,6 +286,7 @@ impl CvmVerifier {
             .hugepages(vm_config.hugepages)
             .num_gpus(vm_config.num_gpus)
             .num_nvswitches(vm_config.num_nvswitches)
+            .shared_disk_mode(vm_config.shared_disk_mode)
             .build()
             .measure_with_logs()
             .context("Failed to compute expected MRs")?;

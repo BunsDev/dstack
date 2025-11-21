@@ -190,6 +190,9 @@ pub struct CvmConfig {
 
     /// Networking configuration
     pub networking: Networking,
+
+    /// Host sharing mode. (9p, vdisk, vvfat)
+    pub host_sharing_mode: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
