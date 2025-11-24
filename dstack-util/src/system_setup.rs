@@ -5,9 +5,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Display,
+    io::{ErrorKind, Write},
     ops::Deref,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     str::FromStr,
     time::Duration,
 };
@@ -148,6 +149,151 @@ fn parse_dstack_options(shared: &HostShared) -> Result<DstackOptions> {
         options.storage_fs = fs.parse().context("Failed to parse storage_fs")?;
     }
     Ok(options)
+}
+
+const TPM_ROOT_KEY_BYTES: usize = 32;
+const TPM_NV_INDEX: &str = "0x01801100";
+
+fn tpm_tcti() -> Option<String> {
+    if Path::new("/dev/tpmrm0").exists() {
+        Some("device:/dev/tpmrm0".into())
+    } else if Path::new("/dev/tpm0").exists() {
+        Some("device:/dev/tpm0".into())
+    } else {
+        None
+    }
+}
+
+fn run_tpm2(cmd: &str, args: &[&str], tcti: &str) -> Result<Option<std::process::Output>> {
+    let mut command = Command::new(cmd);
+    command.env("TPM2TOOLS_TCTI", tcti).args(args);
+    match command.output() {
+        Ok(output) => Ok(Some(output)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn decode_seed_bytes(mut data: Vec<u8>) -> Option<[u8; TPM_ROOT_KEY_BYTES]> {
+    if data.len() >= TPM_ROOT_KEY_BYTES {
+        data.truncate(TPM_ROOT_KEY_BYTES);
+        return data.try_into().ok();
+    }
+
+    if data.is_empty() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&data);
+    let mut bytes = Vec::new();
+    for token in text.split_whitespace() {
+        let token = token.trim_start_matches("0x").trim_start_matches("0X");
+        if token.len() < 2 {
+            continue;
+        }
+        if let Ok(byte) = u8::from_str_radix(&token[..2], 16) {
+            bytes.push(byte);
+        }
+    }
+    if bytes.len() >= TPM_ROOT_KEY_BYTES {
+        bytes.truncate(TPM_ROOT_KEY_BYTES);
+        return bytes.try_into().ok();
+    }
+
+    let hex_str: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex_str.len() >= TPM_ROOT_KEY_BYTES * 2 {
+        if let Ok(mut decoded) = hex::decode(&hex_str[..TPM_ROOT_KEY_BYTES * 2]) {
+            decoded.truncate(TPM_ROOT_KEY_BYTES);
+            return decoded.try_into().ok();
+        }
+    }
+
+    None
+}
+
+fn read_tpm_seed(tcti: &str) -> Result<Option<[u8; TPM_ROOT_KEY_BYTES]>> {
+    let size = TPM_ROOT_KEY_BYTES.to_string();
+    let args = ["-C", "o", "-s", &size, TPM_NV_INDEX];
+    let Some(output) = run_tpm2("tpm2_nvread", &args, tcti)? else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        warn!(
+            "tpm2_nvread {TPM_NV_INDEX} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(None);
+    }
+    Ok(decode_seed_bytes(output.stdout))
+}
+
+fn tpm_random_seed(tcti: &str) -> Result<Option<[u8; TPM_ROOT_KEY_BYTES]>> {
+    let size = TPM_ROOT_KEY_BYTES.to_string();
+    let Some(output) = run_tpm2("tpm2_getrandom", &[&size], tcti)? else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        warn!(
+            "tpm2_getrandom failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(None);
+    }
+    Ok(decode_seed_bytes(output.stdout))
+}
+
+fn persist_tpm_seed(tcti: &str, seed: &[u8]) -> Result<bool> {
+    let size = seed.len().to_string();
+    if let Some(output) = run_tpm2(
+        "tpm2_nvdefine",
+        &[
+            "-C",
+            "o",
+            "-s",
+            &size,
+            "-a",
+            "ownerread|ownerwrite",
+            TPM_NV_INDEX,
+        ],
+        tcti,
+    )? {
+        if !output.status.success() {
+            warn!(
+                "tpm2_nvdefine {TPM_NV_INDEX} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    } else {
+        return Ok(false);
+    }
+
+    let mut child = Command::new("tpm2_nvwrite");
+    child
+        .env("TPM2TOOLS_TCTI", tcti)
+        .args(["-C", "o", "-i", "-", TPM_NV_INDEX])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = child.spawn().context("Failed to start tpm2_nvwrite")?;
+    child
+        .stdin
+        .as_mut()
+        .context("Failed to open stdin for tpm2_nvwrite")?
+        .write_all(seed)?;
+
+    let output = child
+        .wait_with_output()
+        .context("Failed to wait for tpm2_nvwrite")?;
+    if output.status.success() {
+        Ok(true)
+    } else {
+        warn!(
+            "tpm2_nvwrite {TPM_NV_INDEX} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(false)
+    }
 }
 
 impl InstanceInfo {
@@ -738,9 +884,58 @@ impl<'a> Stage0<'a> {
             .await
             .context("Failed to get sealing key")?;
         // write to fs
-        let app_keys = gen_app_keys_from_seed(&provision.sk, Some(provision.mr.to_vec()))
-            .context("Failed to generate app keys")?;
+        let app_keys = gen_app_keys_from_seed(
+            &provision.sk,
+            KeyProviderKind::Local,
+            Some(provision.mr.to_vec()),
+        )
+        .context("Failed to generate app keys")?;
         Ok(app_keys)
+    }
+
+    fn generate_tpm_app_keys(&self) -> Result<AppKeys> {
+        let Some(tcti) = tpm_tcti() else {
+            warn!("TPM key provider selected but no TPM device found; using random seed");
+            let seed: [u8; TPM_ROOT_KEY_BYTES] = rand::thread_rng().gen();
+            return gen_app_keys_from_seed(&seed, KeyProviderKind::Tpm, None)
+                .context("Failed to generate TPM app keys");
+        };
+
+        match read_tpm_seed(&tcti) {
+            Ok(Some(seed)) => {
+                info!("Loaded root key seed from TPM NV index {TPM_NV_INDEX}");
+                return gen_app_keys_from_seed(&seed, KeyProviderKind::Tpm, None)
+                    .context("Failed to generate TPM app keys");
+            }
+            Ok(None) => {}
+            Err(err) => warn!("Failed to read TPM root key seed: {err:?}"),
+        }
+
+        let seed = match tpm_random_seed(&tcti) {
+            Ok(Some(seed)) => {
+                info!("Generated root key seed using TPM RNG");
+                seed
+            }
+            Ok(None) => {
+                info!("TPM RNG unavailable; generating root key seed from OS RNG");
+                rand::thread_rng().gen()
+            }
+            Err(err) => {
+                warn!("TPM RNG failed: {err:?}; generating root key seed from OS RNG");
+                rand::thread_rng().gen()
+            }
+        };
+
+        match persist_tpm_seed(&tcti, &seed) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!("Failed to persist root key seed to TPM; continuing with in-memory seed")
+            }
+            Err(err) => warn!("Failed to write root key seed to TPM: {err:?}"),
+        }
+
+        gen_app_keys_from_seed(&seed, KeyProviderKind::Tpm, None)
+            .context("Failed to generate TPM app keys")
     }
 
     async fn request_app_keys(&self) -> Result<AppKeys> {
@@ -751,8 +946,10 @@ impl<'a> Stage0<'a> {
             KeyProviderKind::None => {
                 info!("No key provider is enabled, generating temporary app keys");
                 let seed: [u8; 32] = rand::thread_rng().gen();
-                gen_app_keys_from_seed(&seed, None).context("Failed to generate app keys")
+                gen_app_keys_from_seed(&seed, KeyProviderKind::None, None)
+                    .context("Failed to generate app keys")
             }
+            KeyProviderKind::Tpm => self.generate_tpm_app_keys(),
         }
     }
 
@@ -1068,6 +1265,9 @@ impl<'a> Stage0<'a> {
             KeyProvider::None { .. } => KeyProviderInfo::new("none".into(), "".into()),
             KeyProvider::Local { mr, .. } => {
                 KeyProviderInfo::new("local-sgx".into(), hex::encode(mr))
+            }
+            KeyProvider::Tpm { pubkey, .. } => {
+                KeyProviderInfo::new("tpm".into(), hex::encode(pubkey))
             }
             KeyProvider::Kms { pubkey, .. } => {
                 KeyProviderInfo::new("kms".into(), hex::encode(pubkey))

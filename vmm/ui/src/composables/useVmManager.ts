@@ -32,7 +32,7 @@ type AppCompose = {
   pre_launch_script?: string;
 };
 
-type KeyProviderKind = 'none' | 'kms' | 'local';
+type KeyProviderKind = 'none' | 'kms' | 'local' | 'tpm';
 
 const x25519 = require('../lib/x25519.js');
 const { getVmmRpcClient } = require('../lib/vmmRpcClient');
@@ -97,6 +97,7 @@ type VmFormState = {
   app_id: string | null;
   kms_enabled: boolean;
   local_key_provider_enabled: boolean;
+  key_provider?: KeyProviderKind;
   key_provider_id: string;
   gateway_enabled: boolean;
   public_logs: boolean;
@@ -178,6 +179,7 @@ function createVmFormState(preLaunchScript: string): VmFormState {
     app_id: null,
     kms_enabled: true,
     local_key_provider_enabled: false,
+    key_provider: undefined,
     key_provider_id: '',
     gateway_enabled: true,
     public_logs: true,
@@ -723,6 +725,10 @@ type CreateVmPayloadSource = {
       secure_time: false,
     };
 
+    if (vmForm.value.key_provider !== undefined) {
+      appCompose.key_provider = vmForm.value.key_provider;
+    }
+
     if (vmForm.value.storage_fs) {
       appCompose.storage_fs = vmForm.value.storage_fs;
     }
@@ -794,6 +800,7 @@ type CreateVmPayloadSource = {
       () => vmForm.value.public_sysinfo,
       () => vmForm.value.public_tcbinfo,
       () => vmForm.value.local_key_provider_enabled,
+      () => vmForm.value.key_provider,
       () => vmForm.value.key_provider_id,
       () => vmForm.value.encryptedEnvs,
       () => vmForm.value.storage_fs,
@@ -1097,6 +1104,7 @@ type CreateVmPayloadSource = {
       kms_enabled: !!theVm.appCompose?.kms_enabled,
       kms_urls: config.kms_urls || [],
       local_key_provider_enabled: !!theVm.appCompose?.local_key_provider_enabled,
+      key_provider: theVm.appCompose?.key_provider,
       key_provider_id: theVm.appCompose?.key_provider_id || '',
       gateway_enabled: !!theVm.appCompose?.gateway_enabled,
       gateway_urls: config.gateway_urls || [],

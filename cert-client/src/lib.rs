@@ -63,7 +63,9 @@ impl CertRequestClient {
         vm_config: String,
     ) -> Result<CertRequestClient> {
         match &keys.key_provider {
-            KeyProvider::None { key } | KeyProvider::Local { key, .. } => {
+            KeyProvider::None { key }
+            | KeyProvider::Local { key, .. }
+            | KeyProvider::Tpm { key, .. } => {
                 let ca = CaCert::new(keys.ca_cert.clone(), key.clone())
                     .context("Failed to create CA")?;
                 Ok(CertRequestClient::Local { ca })

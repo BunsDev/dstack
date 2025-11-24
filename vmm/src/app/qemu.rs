@@ -25,7 +25,7 @@ use dstack_types::{
     shared_filenames::{
         APP_COMPOSE, ENCRYPTED_ENV, HOST_SHARED_DISK_LABEL, INSTANCE_INFO, USER_CONFIG,
     },
-    AppCompose,
+    AppCompose, KeyProviderKind,
 };
 use dstack_vmm_rpc as pb;
 use fs_err as fs;
@@ -428,6 +428,7 @@ impl VmConfig {
         if !shared_dir.exists() {
             fs::create_dir_all(&shared_dir)?;
         }
+        let app_compose = workdir.app_compose().context("Failed to get app compose")?;
         let qemu = &cfg.qemu_path;
         let mut smp = self.manifest.vcpu.max(1);
         let mut mem = self.manifest.memory;
@@ -530,7 +531,22 @@ impl VmConfig {
         command.arg("-netdev").arg(netdev);
         command.arg("-device").arg("virtio-net-pci,netdev=net0");
 
-        self.configure_machine(&mut command, &workdir, cfg)?;
+        self.configure_machine(&mut command, &workdir, cfg, &app_compose)?;
+
+        if matches!(app_compose.key_provider(), KeyProviderKind::Tpm) {
+            let tpm_path = if Path::new("/dev/tpmrm0").exists() {
+                "/dev/tpmrm0"
+            } else if Path::new("/dev/tpm0").exists() {
+                "/dev/tpm0"
+            } else {
+                bail!("TPM key provider requested but no TPM device found on host");
+            };
+            command
+                .arg("-tpmdev")
+                .arg(format!("passthrough,id=tpm0,path={tpm_path}"))
+                .arg("-device")
+                .arg("tpm-tis,tpmdev=tpm0");
+        }
 
         command
             .arg("-device")
@@ -761,6 +777,7 @@ impl VmConfig {
         command: &mut Command,
         workdir: &VmWorkDir,
         cfg: &CvmConfig,
+        app_compose: &AppCompose,
     ) -> Result<()> {
         if self.manifest.no_tee {
             command
@@ -776,7 +793,6 @@ impl VmConfig {
         let img_ver = self.image.info.version_tuple().unwrap_or_default();
         let support_mr_config_id = img_ver >= (0, 5, 2);
         let tdx_object = if cfg.use_mrconfigid && support_mr_config_id {
-            let app_compose = workdir.app_compose().context("Failed to get app compose")?;
             let compose_hash = workdir
                 .app_compose_hash()
                 .context("Failed to get compose hash")?;
