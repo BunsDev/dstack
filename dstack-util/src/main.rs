@@ -54,6 +54,8 @@ enum Commands {
     Extend(ExtendArgs),
     /// Show the current RTMR state
     Show,
+    /// Replay event log and show calculated IMR/RTMR values
+    ReplayImr,
     /// Hex encode data
     Hex(HexCommand),
     /// Generate a RA-TLS certificate
@@ -72,6 +74,8 @@ enum Commands {
     NotifyHost(HostNotifyArgs),
     /// Remove orphaned containers
     RemoveOrphans(RemoveOrphansArgs),
+    /// Perform vTPM attestation (for GCP TEE instances)
+    VtpmAttest(VtpmAttestArgs),
 }
 
 #[derive(Parser)]
@@ -189,6 +193,30 @@ struct RemoveOrphansArgs {
     compose: String,
 }
 
+#[derive(Parser)]
+/// Perform vTPM attestation
+struct VtpmAttestArgs {
+    /// path to Root CA certificate (PEM format)
+    #[arg(long)]
+    root_ca: PathBuf,
+
+    /// nonce for replay protection
+    #[arg(long)]
+    nonce: String,
+
+    /// expected OS image SHA256 hash (optional)
+    #[arg(long)]
+    expected_os_hash: Option<String>,
+
+    /// key algorithm (rsa or ecc, default: rsa)
+    #[arg(long, default_value = "rsa")]
+    key_algo: String,
+
+    /// output format (json or text, default: text)
+    #[arg(long, default_value = "text")]
+    format: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ComposeConfig {
     name: Option<String>,
@@ -289,6 +317,57 @@ fn cmd_show_mrs() -> Result<()> {
         .context("Failed to decode app info")?;
     serde_json::to_writer_pretty(io::stdout(), &app_info).context("Failed to write app info")?;
     println!();
+    Ok(())
+}
+
+fn cmd_replay_imr() -> Result<()> {
+    use sha2::Digest;
+
+    println!("=== Event Log Replay: Calculated IMR/RTMR Values ===\n");
+
+    // Read and replay event logs
+    let event_logs = att::eventlog::read_event_logs().context("Failed to read event logs")?;
+
+    println!("Total events: {}", event_logs.len());
+
+    // Count events per IMR
+    let mut imr_counts = [0u32; 4];
+    for event in &event_logs {
+        if event.imr < 4 {
+            imr_counts[event.imr as usize] += 1;
+        }
+    }
+
+    println!("Event distribution:");
+    for (idx, count) in imr_counts.iter().enumerate() {
+        println!("  IMR {}: {} events", idx, count);
+    }
+    println!();
+
+    // Replay event logs to calculate IMR/RTMR values
+    println!("Replaying event log...");
+    let mut rtmrs: [[u8; 48]; 4] = [[0u8; 48]; 4];
+
+    for event in &event_logs {
+        if event.imr < 4 {
+            let mut hasher = sha2::Sha384::new();
+            hasher.update(rtmrs[event.imr as usize]);
+            hasher.update(event.digest);
+            rtmrs[event.imr as usize] = hasher.finalize().into();
+        }
+    }
+
+    println!("\nCalculated IMR/RTMR values from event log replay:\n");
+    println!("IMR 0 (CCEL) → {}", hex::encode(rtmrs[0]));
+    println!("IMR 1 (CCEL) → {}", hex::encode(rtmrs[1]));
+    println!("IMR 2 (CCEL) → {}", hex::encode(rtmrs[2]));
+    println!("IMR 3 (CCEL) → {}", hex::encode(rtmrs[3]));
+
+    println!("\n========================================");
+    println!("Note: These are the calculated values from replaying the CCEL event log.");
+    println!("The mapping between CCEL IMR indices and TDX RTMR indices may vary");
+    println!("depending on the platform implementation.");
+
     Ok(())
 }
 
@@ -453,6 +532,221 @@ fn get_project_name(compose_file: impl AsRef<Path>) -> Result<String> {
     Ok(project_name)
 }
 
+fn cmd_vtpm_attest(args: VtpmAttestArgs) -> Result<()> {
+    use cmd_lib::run_cmd;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct AttestationResult {
+        success: bool,
+        ek_cert_verified: bool,
+        quote_verified: bool,
+        os_image_verified: Option<bool>,
+        nonce: String,
+        key_algorithm: String,
+        error: Option<String>,
+    }
+
+    // verify root CA file exists
+    if !args.root_ca.exists() {
+        anyhow::bail!("root CA file not found: {:?}", args.root_ca);
+    }
+
+    // verify key algorithm
+    let (ek_algo, ak_algo, ak_scheme, algo_name) = match args.key_algo.to_lowercase().as_str() {
+        "rsa" => ("rsa", "rsa", "rsassa", "RSA-2048"),
+        "ecc" | "ecdsa" => ("ecc", "ecc", "ecdsa", "ECC P-256"),
+        _ => anyhow::bail!(
+            "invalid key algorithm: {}. Use 'rsa' or 'ecc'",
+            args.key_algo
+        ),
+    };
+
+    let mut result = AttestationResult {
+        success: false,
+        ek_cert_verified: false,
+        quote_verified: false,
+        os_image_verified: None,
+        nonce: args.nonce.clone(),
+        key_algorithm: algo_name.to_string(),
+        error: None,
+    };
+
+    let attestation_result = (|| -> Result<()> {
+        if args.format == "text" {
+            println!("=== vTPM Attestation ===");
+            println!("Root CA: {:?}", args.root_ca);
+            println!("Nonce: {}", args.nonce);
+            println!("Key Algorithm: {}", algo_name);
+            println!();
+        }
+
+        // step 1: extract EK certificate
+        if args.format == "text" {
+            println!("[1/7] extracting EK certificate...");
+        }
+        run_cmd! {
+            tpm2_nvread -o /tmp/ek_cert.der 0x1c00002 2>/dev/null;
+            openssl x509 -inform DER -in /tmp/ek_cert.der -out /tmp/ek_cert.pem 2>/dev/null;
+        }
+        .context("failed to extract EK certificate")?;
+
+        // step 2: extract intermediate CA URL
+        if args.format == "text" {
+            println!("[2/7] downloading intermediate CA...");
+        }
+        let ica_url_output = std::process::Command::new("openssl")
+            .args(&["x509", "-in", "/tmp/ek_cert.pem", "-noout", "-text"])
+            .output()
+            .context("failed to read EK cert")?;
+        let ica_text = String::from_utf8_lossy(&ica_url_output.stdout);
+        let ica_url = ica_text
+            .lines()
+            .find(|l| l.contains("CA Issuers") && l.contains("URI:"))
+            .and_then(|l| l.split("URI:").nth(1))
+            .map(|s| s.trim())
+            .context("failed to find Intermediate CA URL")?;
+
+        run_cmd! {
+            curl -s -o /tmp/intermediate_ca.crt $ica_url;
+        }
+        .context("failed to download intermediate CA")?;
+
+        // try DER first, then PEM
+        let convert_result = run_cmd! {
+            openssl x509 -inform DER -in /tmp/intermediate_ca.crt -outform PEM -out /tmp/intermediate_ca.pem 2>/dev/null;
+        };
+        if convert_result.is_err() {
+            run_cmd! {
+                openssl x509 -inform PEM -in /tmp/intermediate_ca.crt -outform PEM -out /tmp/intermediate_ca.pem 2>/dev/null;
+            }
+            .context("failed to convert intermediate CA")?;
+        }
+
+        // step 3: verify intermediate CA
+        if args.format == "text" {
+            println!("[3/7] verifying certificate chain...");
+        }
+        let root_ca_path = args.root_ca.to_str().context("invalid root CA path")?;
+        run_cmd! {
+            openssl verify -CAfile $root_ca_path /tmp/intermediate_ca.pem >/dev/null 2>&1;
+        }
+        .context("intermediate CA verification failed")?;
+
+        // step 4: verify EK certificate
+        run_cmd! {
+            cat /tmp/intermediate_ca.pem $root_ca_path > /tmp/ca_chain.pem;
+            openssl verify -CAfile /tmp/ca_chain.pem /tmp/ek_cert.pem >/dev/null 2>&1;
+        }
+        .context("EK certificate verification failed")?;
+        result.ek_cert_verified = true;
+
+        // step 5: create AK
+        if args.format == "text" {
+            println!("[4/7] creating attestation key ({})...", algo_name);
+        }
+        run_cmd! {
+            tpm2_createek -c /tmp/ek.ctx -G $ek_algo -u /tmp/ek.pub >/dev/null 2>&1;
+            tpm2_createak -C /tmp/ek.ctx -c /tmp/ak.ctx -G $ak_algo -g sha256 -s $ak_scheme -u /tmp/ak.pub -n /tmp/ak.name >/dev/null 2>&1;
+        }
+        .context("failed to create attestation key")?;
+
+        // step 6: generate quote
+        if args.format == "text" {
+            println!("[5/7] generating TPM quote...");
+        }
+        let nonce = &args.nonce;
+        run_cmd! {
+            echo -n $nonce > /tmp/nonce.bin;
+            tpm2_quote -c /tmp/ak.ctx -l sha256:0,1,2,3,4,5,6,7,8,9,10,14 -q /tmp/nonce.bin -m /tmp/quote.msg -s /tmp/quote.sig -o /tmp/quote.pcr -g sha256 >/dev/null 2>&1;
+        }
+        .context("failed to generate quote")?;
+
+        // step 7: verify quote
+        if args.format == "text" {
+            println!("[6/7] verifying quote signature...");
+        }
+        run_cmd! {
+            tpm2_checkquote -u /tmp/ak.pub -m /tmp/quote.msg -s /tmp/quote.sig -f /tmp/quote.pcr -g sha256 -q /tmp/nonce.bin >/dev/null 2>&1;
+        }
+        .context("quote verification failed")?;
+        result.quote_verified = true;
+
+        // step 8: verify OS image (optional)
+        if let Some(expected_hash) = &args.expected_os_hash {
+            if args.format == "text" {
+                println!("[7/7] verifying OS image...");
+            }
+            let tpm_eventlog_path = "/sys/kernel/security/tpm0/binary_bios_measurements";
+            if Path::new(tpm_eventlog_path).exists() {
+                let _ = run_cmd! {
+                    tpm2_eventlog $tpm_eventlog_path > /tmp/eventlog.yaml 2>/dev/null;
+                };
+
+                let eventlog = fs::read_to_string("/tmp/eventlog.yaml").unwrap_or_default();
+                if eventlog.contains(expected_hash) {
+                    result.os_image_verified = Some(true);
+                } else {
+                    result.os_image_verified = Some(false);
+                    anyhow::bail!("OS image hash mismatch");
+                }
+            }
+        }
+
+        result.success = true;
+        Ok(())
+    })();
+
+    if let Err(e) = attestation_result {
+        result.error = Some(format!("{:#}", e));
+    }
+
+    if args.format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!();
+        println!("=== Attestation Result ===");
+        println!(
+            "  EK Certificate Chain: {}",
+            if result.ek_cert_verified {
+                "✓ VERIFIED"
+            } else {
+                "✗ FAILED"
+            }
+        );
+        println!(
+            "  TPM Quote: {}",
+            if result.quote_verified {
+                "✓ VERIFIED"
+            } else {
+                "✗ FAILED"
+            }
+        );
+        if let Some(os_verified) = result.os_image_verified {
+            println!(
+                "  OS Image: {}",
+                if os_verified {
+                    "✓ VERIFIED"
+                } else {
+                    "✗ MISMATCH"
+                }
+            );
+        }
+        println!();
+        if result.success {
+            println!("🎉 ATTESTATION PASSED");
+        } else {
+            println!("❌ ATTESTATION FAILED");
+            if let Some(error) = &result.error {
+                println!("Error: {}", error);
+            }
+            anyhow::bail!("attestation failed");
+        }
+    }
+
+    Ok(())
+}
+
 async fn cmd_remove_orphans(compose_file: impl AsRef<Path>) -> Result<()> {
     // Connect to Docker daemon
     let docker =
@@ -539,6 +833,7 @@ async fn main() -> Result<()> {
         Commands::Quote => cmd_quote()?,
         Commands::Eventlog => cmd_eventlog()?,
         Commands::Show => cmd_show_mrs()?,
+        Commands::ReplayImr => cmd_replay_imr()?,
         Commands::Extend(extend_args) => {
             cmd_extend(extend_args)?;
         }
@@ -568,6 +863,9 @@ async fn main() -> Result<()> {
         }
         Commands::RemoveOrphans(args) => {
             cmd_remove_orphans(args.compose).await?;
+        }
+        Commands::VtpmAttest(args) => {
+            cmd_vtpm_attest(args)?;
         }
     }
 

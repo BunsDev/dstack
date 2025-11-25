@@ -114,16 +114,16 @@ impl<T> Attestation<T> {
         Quote::parse(&self.quote)
     }
 
-    fn find_event(&self, imr: u32, ad: &str) -> Result<EventLog> {
+    fn find_event(&self, imr: u32, name: &str) -> Result<EventLog> {
         for event in &self.event_log {
             if event.imr == 3 && event.event == "system-ready" {
                 break;
             }
-            if event.imr == imr && event.event == ad {
+            if event.imr == imr && event.event == name {
                 return Ok(event.clone());
             }
         }
-        Err(anyhow!("event {ad} not found"))
+        Err(anyhow!("event {name} not found"))
     }
 
     /// Replay event logs
@@ -200,7 +200,7 @@ impl<T> Attestation<T> {
         };
         Ok(AppInfo {
             app_id: self.find_event_payload("app-id").unwrap_or_default(),
-            compose_hash: self.find_event_payload("compose-hash")?,
+            compose_hash: self.find_event_payload("compose-hash").unwrap_or_default(),
             instance_id: self.find_event_payload("instance-id").unwrap_or_default(),
             device_id,
             mrtd: td_report.mr_td,
