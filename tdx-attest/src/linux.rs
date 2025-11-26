@@ -130,7 +130,56 @@ pub fn log_rtmr_event(log: &TdxEventLog) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn extend_rtmr(index: u32, event_type: u32, digest: [u8; 48]) -> Result<()> {
+/// TSM measurements sysfs paths for RTMR extend (kernel 6.17+)
+const TSM_MEASUREMENTS_PATHS: &[&str] = &[
+    // Standard path when tdx_guest is loaded
+    "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0017:00/tdx_guest/measurements",
+    // Alternative path pattern
+    "/sys/class/misc/tdx_guest/device/measurements",
+];
+
+/// Find the TSM measurements sysfs directory
+fn find_tsm_measurements_dir() -> Option<std::path::PathBuf> {
+    for base_path in TSM_MEASUREMENTS_PATHS {
+        let path = std::path::Path::new(base_path);
+        if path.is_dir() {
+            return Some(path.to_path_buf());
+        }
+    }
+
+    // Try to find via glob pattern
+    if let Ok(entries) = std::fs::read_dir("/sys/devices") {
+        for entry in entries.flatten() {
+            let measurements_path = entry.path().join("tdx_guest/measurements");
+            if measurements_path.is_dir() {
+                return Some(measurements_path);
+            }
+        }
+    }
+
+    None
+}
+
+/// Extend RTMR using TSM measurements sysfs interface (kernel 6.17+)
+fn extend_rtmr_tsm(index: u32, digest: &[u8; 48]) -> std::io::Result<()> {
+    let measurements_dir = find_tsm_measurements_dir()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "TSM measurements sysfs not found"))?;
+
+    let rtmr_file = measurements_dir.join(format!("rtmr{}:sha384", index));
+
+    if !rtmr_file.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("RTMR{} sysfs file not found: {:?}", index, rtmr_file),
+        ));
+    }
+
+    fs::write(&rtmr_file, digest)?;
+    Ok(())
+}
+
+/// Extend RTMR using legacy ioctl interface
+fn extend_rtmr_ioctl(index: u32, event_type: u32, digest: [u8; 48]) -> Result<()> {
     let event = tdx_rtmr_event_t {
         version: 1,
         rtmr_index: index as u64,
@@ -144,6 +193,19 @@ pub fn extend_rtmr(index: u32, event_type: u32, digest: [u8; 48]) -> Result<()> 
         return Err(error.into());
     }
     Ok(())
+}
+
+/// Extend RTMR with automatic fallback
+///
+/// Tries TSM measurements sysfs first (kernel 6.17+), falls back to ioctl
+pub fn extend_rtmr(index: u32, event_type: u32, digest: [u8; 48]) -> Result<()> {
+    // Try TSM sysfs first (kernel 6.17+)
+    if extend_rtmr_tsm(index, &digest).is_ok() {
+        return Ok(());
+    }
+
+    // Fall back to legacy ioctl
+    extend_rtmr_ioctl(index, event_type, digest)
 }
 
 pub fn get_supported_att_key_ids() -> Result<Vec<TdxUuid>> {
