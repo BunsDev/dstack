@@ -333,7 +333,17 @@ impl Attestation {
                 .replay_event_logs(None)
                 .context("Failed to replay event logs")?;
             if rtmrs != [report.rt_mr0, report.rt_mr1, report.rt_mr2, report.rt_mr3] {
-                bail!("RTMR mismatch");
+                let hexed_mrs = |mrs: &[[u8; 48]]| {
+                    mrs.iter()
+                        .map(|m| hex::encode(m))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                bail!(
+                    "RTMR mismatch, expected: {}, got: {}",
+                    hexed_mrs(&rtmrs),
+                    hexed_mrs(&[report.rt_mr0, report.rt_mr1, report.rt_mr2, report.rt_mr3]),
+                );
             }
         }
         validate_tcb(&report)?;

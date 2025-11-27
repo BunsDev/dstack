@@ -23,7 +23,7 @@ const CCEL_FILE: &str = "/sys/firmware/acpi/tables/data/CCEL";
 /// according to request.
 #[derive(Clone, scale::Decode)]
 pub struct TcgEventLog {
-    /// IMR index (starts from 1 for mainline OVMF, starts from 0 for GCP)
+    /// IMR index starts from 1
     pub imr_index: u32,
     /// Event type
     pub event_type: u32,
@@ -122,7 +122,10 @@ impl TryFrom<TcgEventLog> for TdxEventLog {
             .ok()
             .context("invalid digest size")?;
         Ok(TdxEventLog {
-            imr: value.imr_index,
+            imr: value
+                .imr_index
+                .checked_sub(1)
+                .context("invalid IMR index: must be >= 1")?,
             event_type: value.event_type,
             digest,
             event: Default::default(),
@@ -208,25 +211,12 @@ impl EventLogs {
         Self::decode(&mut data.as_slice())
     }
 
-    fn imr_shift(&self) -> u32 {
-        self.event_logs.first().map_or(0, |log| log.imr_index)
-    }
-
     pub fn to_tdx_event_logs(&self) -> Result<Vec<TdxEventLog>> {
-        fn fix_imr(mut log: TcgEventLog, shift: u32) -> Result<TcgEventLog> {
-            // GCP IMR index starts from 0
-            // OVMF IMR index starts from 1
-            log.imr_index = log
-                .imr_index
-                .checked_sub(shift)
-                .context("Failed to correct IMR")?;
-            Ok(log)
-        }
-        let shift = self.imr_shift();
         self.event_logs
             .iter()
+            .filter(|log| log.imr_index > 0) // GCP fills some IMRs starting from 0
             .cloned()
-            .map(|log| TdxEventLog::try_from(fix_imr(log, shift)?))
+            .map(|log| TdxEventLog::try_from(log))
             .collect()
     }
 }
