@@ -327,6 +327,50 @@ pub struct CertPair {
     pub key_pem: String,
 }
 
+/// Magic prefix for gzip-compressed event log (version 1)
+pub const EVENTLOG_GZIP_MAGIC: &[u8] = b"ELGZv1";
+
+/// Compress event log data using gzip
+pub fn compress_event_log(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder
+        .write_all(data)
+        .context("failed to write to gzip encoder")?;
+    let compressed = encoder
+        .finish()
+        .context("failed to finish gzip compression")?;
+
+    // Prepend magic prefix
+    let mut result = Vec::with_capacity(EVENTLOG_GZIP_MAGIC.len() + compressed.len());
+    result.extend_from_slice(EVENTLOG_GZIP_MAGIC);
+    result.extend_from_slice(&compressed);
+    Ok(result)
+}
+
+/// Decompress event log data (handles both compressed and uncompressed formats)
+pub fn decompress_event_log(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    if data.starts_with(EVENTLOG_GZIP_MAGIC) {
+        // Compressed format
+        let compressed = &data[EVENTLOG_GZIP_MAGIC.len()..];
+        let mut decoder = GzDecoder::new(compressed);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .context("failed to decompress event log")?;
+        Ok(decompressed)
+    } else {
+        // Uncompressed format (backwards compatibility)
+        Ok(data.to_vec())
+    }
+}
+
 /// Generate a certificate with RA-TLS quote and event log.
 pub fn generate_ra_cert(ca_cert_pem: String, ca_key_pem: String) -> Result<CertPair> {
     use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
@@ -341,6 +385,8 @@ pub fn generate_ra_cert(ca_cert_pem: String, ca_key_pem: String) -> Result<CertP
 
     let event_log = serde_json::to_vec(&event_logs).context("Failed to serialize RTMR3 events")?;
 
+    // Compress RTMR3 events to reduce certificate size
+    let event_log = compress_event_log(&event_log).context("Failed to compress RTMR3 events")?;
 
     let req = CertRequest::builder()
         .subject("RA-TLS TEMP Cert")
@@ -410,5 +456,49 @@ mod tests {
 
         let signature = csr.signed_by(&key_pair).unwrap();
         assert!(csr.verify(&signature).is_err());
+    }
+
+    #[test]
+    fn test_event_log_compression() {
+        // Test with typical event log JSON data
+        let event_log = r#"[{"imr":0,"event_type":1,"digest":"abc123","event":"test","event_payload":"deadbeef"}]"#;
+        let original = event_log.as_bytes();
+
+        // Compress
+        let compressed = compress_event_log(original).unwrap();
+        assert!(compressed.starts_with(EVENTLOG_GZIP_MAGIC));
+
+        // Decompress
+        let decompressed = decompress_event_log(&compressed).unwrap();
+        assert_eq!(decompressed, original);
+
+        // Test backwards compatibility with uncompressed data
+        let decompressed_uncompressed = decompress_event_log(original).unwrap();
+        assert_eq!(decompressed_uncompressed, original);
+    }
+
+    #[test]
+    fn test_event_log_compression_ratio() {
+        // Simulate a large event log with repetitive data (like certificates)
+        let mut large_data = Vec::new();
+        for i in 0..100 {
+            large_data.extend_from_slice(format!(
+                r#"{{"imr":{},"event_type":1,"digest":"{}","event":"test{}","event_payload":"{}"}},"#,
+                i % 4,
+                "a".repeat(96),
+                i,
+                "deadbeef".repeat(100)
+            ).as_bytes());
+        }
+
+        let compressed = compress_event_log(&large_data).unwrap();
+        let ratio = compressed.len() as f64 / large_data.len() as f64;
+
+        // Compression should achieve at least 50% reduction for repetitive data
+        assert!(ratio < 0.5, "compression ratio {} should be < 0.5", ratio);
+
+        // Verify decompression works
+        let decompressed = decompress_event_log(&compressed).unwrap();
+        assert_eq!(decompressed, large_data);
     }
 }

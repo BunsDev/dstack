@@ -5494,6 +5494,7 @@ dependencies = [
  "cc-eventlog",
  "dcap-qvl",
  "elliptic-curve",
+ "flate2",
  "fs-err",
  "hex",
  "hkdf",

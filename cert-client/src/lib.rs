@@ -107,6 +107,9 @@ impl CertRequestClient {
             let event_logs = read_runtime_event_logs().context("Failed to decode event log")?;
             let event_log =
                 serde_json::to_vec(&event_logs).context("Failed to serialize RTMR3 events")?;
+            // Compress to reduce certificate size
+            let event_log =
+                compress_event_log(&event_log).context("Failed to compress RTMR3 events")?;
             (quote, event_log)
         } else {
             (vec![], vec![])

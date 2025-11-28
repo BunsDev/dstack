@@ -253,9 +253,12 @@ impl Attestation {
         })
     }
 
-    /// Create a new attestation
-    pub fn new(quote: Vec<u8>, raw_event_log: Vec<u8>) -> Result<Self> {
+    /// Create a new attestation from full event log format
+    pub fn new(quote: Vec<u8>, mut raw_event_log: Vec<u8>) -> Result<Self> {
         let event_log: Vec<EventLog> = if !raw_event_log.is_empty() {
+            // Decompress if needed (handles both compressed and uncompressed formats)
+            raw_event_log = crate::cert::decompress_event_log(&raw_event_log)
+                .context("failed to decompress event log")?;
             serde_json::from_slice(&raw_event_log).context("invalid event log")?
         } else {
             vec![]
