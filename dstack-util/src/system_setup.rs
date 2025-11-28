@@ -1271,6 +1271,20 @@ impl<'a> Stage0<'a> {
             echo -n $disk_crypt_key | cryptsetup luksOpen --type luks2 --header $in_mem_hdr -d- $root_hd $name;
         }
         .or(Err(anyhow!("Failed to open encrypted data disk")))?;
+
+        // Wait for device mapper to create the device
+        let dm_path = format!("/dev/mapper/{name}");
+        for i in 0..10 {
+            if std::path::Path::new(&dm_path).exists() {
+                info!("Device mapper {} is ready", dm_path);
+                break;
+            }
+            if i == 9 {
+                bail!("Timed out waiting for device mapper {}", dm_path);
+            }
+            info!("Waiting for device mapper {}...", dm_path);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
         Ok(())
     }
 
