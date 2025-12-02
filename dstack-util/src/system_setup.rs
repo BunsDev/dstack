@@ -1111,11 +1111,7 @@ impl<'a> Stage0<'a> {
         initialized
     }
 
-    async fn mount_data_disk(
-        &self,
-        disk_crypt_key: &str,
-        opts: &DstackOptions,
-    ) -> Result<()> {
+    async fn mount_data_disk(&self, disk_crypt_key: &str, opts: &DstackOptions) -> Result<()> {
         let name = "dstack_data_disk";
         let mount_point = &self.args.mount_point;
 
@@ -1326,12 +1322,14 @@ impl<'a> Stage0<'a> {
             sha256(&id_path)[..20].to_vec()
         };
         instance_info.instance_id = instance_id.clone();
-        if !kms_enabled && instance_info.app_id != truncated_compose_hash {
-            bail!("App upgrade is not supported without KMS");
-        }
+        let app_id = if kms_enabled {
+            instance_info.app_id.clone()
+        } else {
+            truncated_compose_hash.to_vec()
+        };
 
         extend_rtmr3("system-preparing", &[])?;
-        extend_rtmr3("app-id", &instance_info.app_id)?;
+        extend_rtmr3("app-id", &app_id)?;
         extend_rtmr3("compose-hash", &compose_hash)?;
         extend_rtmr3("instance-id", &instance_id)?;
         extend_rtmr3("boot-mr-done", &[])?;
@@ -1401,11 +1399,8 @@ impl<'a> Stage0<'a> {
             opts.storage_encrypted, opts.storage_fs
         );
 
-        self.mount_data_disk(
-            &hex::encode(&app_keys.disk_crypt_key),
-            &opts,
-        )
-        .await?;
+        self.mount_data_disk(&hex::encode(&app_keys.disk_crypt_key), &opts)
+            .await?;
         self.setup_swap(self.shared.app_compose.swap_size, &opts)
             .await?;
         self.vmm

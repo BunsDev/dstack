@@ -29,7 +29,8 @@ pub fn extend_rtmr3(event: &str, payload: &[u8]) -> anyhow::Result<()> {
     use anyhow::Context;
     let event_type = eventlog::DSTACK_RUNTIME_EVENT_TYPE;
     let index = 3;
-    let log = eventlog::TdxEventLogEntry::new(index, event_type, event.to_string(), payload.to_vec());
+    let log =
+        eventlog::TdxEventLogEntry::new(index, event_type, event.to_string(), payload.to_vec());
     let digest = log
         .digest()
         .try_into()
