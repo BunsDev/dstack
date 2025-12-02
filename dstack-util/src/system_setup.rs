@@ -211,7 +211,18 @@ fn decode_seed_bytes(mut data: Vec<u8>) -> Option<[u8; TPM_ROOT_KEY_BYTES]> {
     None
 }
 
+fn tpm_nv_exists(tcti: &str, index: &str) -> Result<bool> {
+    let Some(output) = run_tpm2("tpm2_nvreadpublic", &[index], tcti)? else {
+        return Ok(false);
+    };
+    Ok(output.status.success())
+}
+
 fn read_tpm_seed(tcti: &str) -> Result<Option<[u8; TPM_ROOT_KEY_BYTES]>> {
+    // Check if NV index exists first to avoid noisy error messages
+    if !tpm_nv_exists(tcti, TPM_NV_INDEX)? {
+        return Ok(None);
+    }
     let size = TPM_ROOT_KEY_BYTES.to_string();
     let args = ["-C", "o", "-s", &size, TPM_NV_INDEX];
     let Some(output) = run_tpm2("tpm2_nvread", &args, tcti)? else {
