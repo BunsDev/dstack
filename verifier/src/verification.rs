@@ -566,7 +566,7 @@ impl CvmVerifier {
         }
     }
 
-    async fn download_image(&self, hex_os_image_hash: &str, dst_dir: &Path) -> Result<()> {
+    pub async fn download_image(&self, hex_os_image_hash: &str, dst_dir: &Path) -> Result<()> {
         let url = self
             .download_url
             .replace("{OS_IMAGE_HASH}", hex_os_image_hash);

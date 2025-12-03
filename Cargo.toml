@@ -82,6 +82,7 @@ lspci = { path = "lspci" }
 sodiumbox = { path = "sodiumbox" }
 serde-duration = { path = "serde-duration" }
 dstack-mr = { path = "dstack-mr" }
+dstack-verifier = { path = "verifier", default-features = false }
 size-parser = { path = "size-parser" }
 
 # Core dependencies

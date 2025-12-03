@@ -5,6 +5,9 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use dstack_verifier::{
+    CvmVerifier, VerificationDetails, VerificationRequest, VerificationResponse,
+};
 use figment::{
     providers::{Env, Format, Toml},
     Figment,
@@ -12,12 +15,6 @@ use figment::{
 use rocket::{fairing::AdHoc, get, post, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
-
-mod types;
-mod verification;
-
-use types::{VerificationRequest, VerificationResponse};
-use verification::CvmVerifier;
 
 #[derive(Parser)]
 #[command(name = "dstack-verifier")]
@@ -52,7 +49,7 @@ async fn verify_cvm(
             error!("Verification failed: {:?}", e);
             Json(VerificationResponse {
                 is_valid: false,
-                details: types::VerificationDetails {
+                details: VerificationDetails {
                     quote_verified: false,
                     event_log_verified: false,
                     os_image_hash_verified: false,

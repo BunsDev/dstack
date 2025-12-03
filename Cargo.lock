@@ -2285,6 +2285,7 @@ dependencies = [
  "dstack-kms-rpc",
  "dstack-mr",
  "dstack-types",
+ "dstack-verifier",
  "fs-err",
  "git-version",
  "hex",

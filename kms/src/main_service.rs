@@ -2,11 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    ffi::OsStr,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use dstack_kms_rpc::{
@@ -16,6 +12,7 @@ use dstack_kms_rpc::{
     SignCertRequest, SignCertResponse,
 };
 use dstack_types::VmConfig;
+use dstack_verifier::CvmVerifier;
 use fs_err as fs;
 use k256::ecdsa::SigningKey;
 use ra_rpc::{Attestation, CallContext, RpcCall};
@@ -27,7 +24,6 @@ use ra_tls::{
 use scale::Decode;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use tokio::{io::AsyncWriteExt, process::Command};
 use tracing::{debug, info};
 use upgrade_authority::BootInfo;
 
@@ -57,6 +53,7 @@ pub struct KmsStateInner {
     k256_key: SigningKey,
     temp_ca_cert: String,
     temp_ca_key: String,
+    verifier: CvmVerifier,
 }
 
 impl KmsState {
@@ -70,6 +67,11 @@ impl KmsState {
             fs::read_to_string(config.tmp_ca_key()).context("Faeild to read temp ca key")?;
         let temp_ca_cert =
             fs::read_to_string(config.tmp_ca_cert()).context("Faeild to read temp ca cert")?;
+        let verifier = CvmVerifier::new(
+            config.image.cache_dir.display().to_string(),
+            config.image.download_url.clone(),
+            config.image.download_timeout,
+        );
         Ok(Self {
             inner: Arc::new(KmsStateInner {
                 config,
@@ -77,6 +79,7 @@ impl KmsState {
                 k256_key,
                 temp_ca_cert,
                 temp_ca_key,
+                verifier,
             }),
         })
     }
@@ -223,9 +226,9 @@ impl RpcHandler {
         let verified_mrs: Mrs = report.into();
 
         let cache_key = {
-            let vm_config =
+            let vm_config_bytes =
                 serde_json::to_vec(vm_config).context("Failed to serialize VM config")?;
-            hex::encode(sha2::Sha256::new_with_prefix(&vm_config).finalize())
+            hex::encode(sha2::Sha256::new_with_prefix(&vm_config_bytes).finalize())
         };
         if let Ok(cached_mrs) = self.get_cached_mrs(&cache_key) {
             cached_mrs
@@ -242,7 +245,9 @@ impl RpcHandler {
             info!("Image {} not found, downloading", hex_os_image_hash);
             tokio::time::timeout(
                 self.state.config.image.download_timeout,
-                self.download_image(&hex_os_image_hash, &image_dir),
+                self.state
+                    .verifier
+                    .download_image(&hex_os_image_hash, &image_dir),
             )
             .await
             .context("Download image timeout")?
@@ -294,130 +299,6 @@ impl RpcHandler {
         expected_mrs
             .assert_eq(&verified_mrs)
             .context("MRs do not match")?;
-        Ok(())
-    }
-
-    async fn download_image(&self, hex_os_image_hash: &str, dst_dir: &Path) -> Result<()> {
-        // Create a hex representation of the os_image_hash for URL and directory naming
-        let url = self
-            .state
-            .config
-            .image
-            .download_url
-            .replace("{OS_IMAGE_HASH}", hex_os_image_hash);
-
-        // Create a temporary directory for extraction within the cache directory
-        let cache_dir = self.image_cache_dir().join("tmp");
-        fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
-        let auto_delete_temp_dir = tempfile::Builder::new()
-            .prefix("tmp-download-")
-            .tempdir_in(&cache_dir)
-            .context("Failed to create temporary directory")?;
-        let tmp_dir = auto_delete_temp_dir.path();
-        // Download the image tarball
-        info!("Downloading image from {}", url);
-        let client = reqwest::Client::new();
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to download image")?;
-
-        if !response.status().is_success() {
-            bail!(
-                "Failed to download image: HTTP status {}, url: {url}",
-                response.status(),
-            );
-        }
-
-        // Save the tarball to a temporary file using streaming
-        let tarball_path = tmp_dir.join("image.tar.gz");
-        let mut file = tokio::fs::File::create(&tarball_path)
-            .await
-            .context("Failed to create tarball file")?;
-        let mut response = response;
-        while let Some(chunk) = response.chunk().await? {
-            file.write_all(&chunk)
-                .await
-                .context("Failed to write chunk to file")?;
-        }
-
-        let extracted_dir = tmp_dir.join("extracted");
-        fs::create_dir_all(&extracted_dir).context("Failed to create extraction directory")?;
-
-        // Extract the tarball
-        let output = Command::new("tar")
-            .arg("xzf")
-            .arg(&tarball_path)
-            .current_dir(&extracted_dir)
-            .output()
-            .await
-            .context("Failed to extract tarball")?;
-
-        if !output.status.success() {
-            bail!(
-                "Failed to extract tarball: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Verify checksum
-        let output = Command::new("sha256sum")
-            .arg("-c")
-            .arg("sha256sum.txt")
-            .current_dir(&extracted_dir)
-            .output()
-            .await
-            .context("Failed to verify checksum")?;
-
-        if !output.status.success() {
-            bail!(
-                "Checksum verification failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        // Remove the files that are not listed in sha256sum.txt
-        let sha256sum_path = extracted_dir.join("sha256sum.txt");
-        let files_doc =
-            fs::read_to_string(&sha256sum_path).context("Failed to read sha256sum.txt")?;
-        let listed_files: Vec<&OsStr> = files_doc
-            .lines()
-            .flat_map(|line| line.split_whitespace().nth(1))
-            .map(|s| s.as_ref())
-            .collect();
-        let files = fs::read_dir(&extracted_dir).context("Failed to read directory")?;
-        for file in files {
-            let file = file.context("Failed to read directory entry")?;
-            let filename = file.file_name();
-            if !listed_files.contains(&filename.as_os_str()) {
-                if file.path().is_dir() {
-                    fs::remove_dir_all(file.path()).context("Failed to remove directory")?;
-                } else {
-                    fs::remove_file(file.path()).context("Failed to remove file")?;
-                }
-            }
-        }
-
-        // os_image_hash should eq to sha256sum of the sha256sum.txt
-        let os_image_hash = sha2::Sha256::new_with_prefix(files_doc.as_bytes()).finalize();
-        if hex::encode(os_image_hash) != hex_os_image_hash {
-            bail!("os_image_hash does not match sha256sum of the sha256sum.txt");
-        }
-
-        // Move the extracted files to the destination directory
-        let metadata_path = extracted_dir.join("metadata.json");
-        if !metadata_path.exists() {
-            bail!("metadata.json not found in the extracted archive");
-        }
-
-        if dst_dir.exists() {
-            fs::remove_dir_all(dst_dir).context("Failed to remove destination directory")?;
-        }
-        let dst_dir_parent = dst_dir.parent().context("Failed to get parent directory")?;
-        fs::create_dir_all(dst_dir_parent).context("Failed to create parent directory")?;
-        // Move the extracted files to the destination directory
-        fs::rename(extracted_dir, dst_dir)
-            .context("Failed to move extracted files to destination directory")?;
         Ok(())
     }
 
