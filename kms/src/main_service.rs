@@ -14,6 +14,7 @@ use dstack_kms_rpc::{
 use dstack_types::VmConfig;
 use dstack_verifier::CvmVerifier;
 use fs_err as fs;
+use hex_fmt::HexFmt;
 use k256::ecdsa::SigningKey;
 use ra_rpc::{Attestation, CallContext, RpcCall};
 use ra_tls::{
@@ -22,7 +23,6 @@ use ra_tls::{
     kdf,
 };
 use scale::Decode;
-use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tracing::{debug, info};
 use upgrade_authority::BootInfo;
@@ -96,49 +96,6 @@ struct BootConfig {
     os_image_hash: Vec<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
-struct Mrs {
-    mrtd: String,
-    rtmr0: String,
-    rtmr1: String,
-    rtmr2: String,
-}
-
-impl Mrs {
-    fn assert_eq(&self, other: &Self) -> Result<()> {
-        let Self {
-            mrtd,
-            rtmr0,
-            rtmr1,
-            rtmr2,
-        } = self;
-        if mrtd != &other.mrtd {
-            bail!("MRTD does not match");
-        }
-        if rtmr0 != &other.rtmr0 {
-            bail!("RTMR0 does not match");
-        }
-        if rtmr1 != &other.rtmr1 {
-            bail!("RTMR1 does not match");
-        }
-        if rtmr2 != &other.rtmr2 {
-            bail!("RTMR2 does not match");
-        }
-        Ok(())
-    }
-}
-
-impl From<&BootInfo> for Mrs {
-    fn from(report: &BootInfo) -> Self {
-        Self {
-            mrtd: hex::encode(&report.mrtd),
-            rtmr0: hex::encode(&report.rtmr0),
-            rtmr1: hex::encode(&report.rtmr1),
-            rtmr2: hex::encode(&report.rtmr2),
-        }
-    }
-}
-
 impl RpcHandler {
     fn ensure_attested(&self) -> Result<&VerifiedAttestation> {
         let Some(attestation) = &self.attestation else {
@@ -162,10 +119,6 @@ impl RpcHandler {
 
     fn image_cache_dir(&self) -> PathBuf {
         self.state.config.image.cache_dir.join("images")
-    }
-
-    fn mr_cache_dir(&self) -> PathBuf {
-        self.state.config.image.cache_dir.join("computed")
     }
 
     fn remove_cache(&self, parent_dir: &PathBuf, sub_dir: &str) -> Result<()> {
@@ -193,28 +146,6 @@ impl RpcHandler {
         Ok(())
     }
 
-    fn get_cached_mrs(&self, key: &str) -> Result<Mrs> {
-        let path = self.mr_cache_dir().join(key);
-        if !path.exists() {
-            bail!("Cached MRs not found");
-        }
-        let content = fs::read_to_string(path).context("Failed to read cached MRs")?;
-        let cached_mrs: Mrs =
-            serde_json::from_str(&content).context("Failed to parse cached MRs")?;
-        Ok(cached_mrs)
-    }
-
-    fn cache_mrs(&self, key: &str, mrs: &Mrs) -> Result<()> {
-        let path = self.mr_cache_dir().join(key);
-        fs::create_dir_all(path.parent().unwrap()).context("Failed to create cache directory")?;
-        safe_write::safe_write(
-            &path,
-            serde_json::to_string(mrs).context("Failed to serialize cached MRs")?,
-        )
-        .context("Failed to write cached MRs")?;
-        Ok(())
-    }
-
     async fn verify_os_image_hash(&self, vm_config: &VmConfig, report: &BootInfo) -> Result<()> {
         if !self.state.config.image.verify {
             info!("Image verification is disabled");
@@ -223,82 +154,44 @@ impl RpcHandler {
         let hex_os_image_hash = hex::encode(&vm_config.os_image_hash);
         info!("Verifying image {hex_os_image_hash}");
 
-        let verified_mrs: Mrs = report.into();
-
-        let cache_key = {
-            let vm_config_bytes =
-                serde_json::to_vec(vm_config).context("Failed to serialize VM config")?;
-            hex::encode(sha2::Sha256::new_with_prefix(&vm_config_bytes).finalize())
-        };
-        if let Ok(cached_mrs) = self.get_cached_mrs(&cache_key) {
-            cached_mrs
-                .assert_eq(&verified_mrs)
-                .context("MRs do not match (cached)")?;
-            return Ok(());
-        }
-
-        // Create a directory for the image if it doesn't exist
-        let image_dir = self.image_cache_dir().join(&hex_os_image_hash);
-        // Check if metadata.json exists, if not download the image
-        let metadata_path = image_dir.join("metadata.json");
-        if !metadata_path.exists() {
-            info!("Image {} not found, downloading", hex_os_image_hash);
-            tokio::time::timeout(
-                self.state.config.image.download_timeout,
-                self.state
-                    .verifier
-                    .download_image(&hex_os_image_hash, &image_dir),
-            )
+        // Compute expected measurements using verifier (with caching)
+        let expected_measurements = self
+            .state
+            .verifier
+            .compute_measurements_for_config(vm_config)
             .await
-            .context("Download image timeout")?
-            .with_context(|| format!("Failed to download image {hex_os_image_hash}"))?;
+            .context("Failed to compute expected measurements")?;
+
+        // Compare with verified measurements from BootInfo
+        if expected_measurements.mrtd != report.mrtd {
+            bail!(
+                "MRTD mismatch: expected={}, actual={}",
+                HexFmt(&expected_measurements.mrtd),
+                HexFmt(&report.mrtd)
+            );
+        }
+        if expected_measurements.rtmr0 != report.rtmr0 {
+            bail!(
+                "RTMR0 mismatch: expected={}, actual={}",
+                HexFmt(&expected_measurements.rtmr0),
+                HexFmt(&report.rtmr0)
+            );
+        }
+        if expected_measurements.rtmr1 != report.rtmr1 {
+            bail!(
+                "RTMR1 mismatch: expected={}, actual={}",
+                HexFmt(&expected_measurements.rtmr1),
+                HexFmt(&report.rtmr1)
+            );
+        }
+        if expected_measurements.rtmr2 != report.rtmr2 {
+            bail!(
+                "RTMR2 mismatch: expected={}, actual={}",
+                HexFmt(&expected_measurements.rtmr2),
+                HexFmt(&report.rtmr2)
+            );
         }
 
-        let image_info =
-            fs::read_to_string(metadata_path).context("Failed to read image metadata")?;
-        let image_info: dstack_types::ImageInfo =
-            serde_json::from_str(&image_info).context("Failed to parse image metadata")?;
-
-        let fw_path = image_dir.join(&image_info.bios);
-        let kernel_path = image_dir.join(&image_info.kernel);
-        let initrd_path = image_dir.join(&image_info.initrd);
-        let kernel_cmdline = image_info.cmdline + " initrd=initrd";
-
-        let mrs = dstack_mr::Machine::builder()
-            .cpu_count(vm_config.cpu_count)
-            .memory_size(vm_config.memory_size)
-            .firmware(&fw_path.display().to_string())
-            .kernel(&kernel_path.display().to_string())
-            .initrd(&initrd_path.display().to_string())
-            .kernel_cmdline(&kernel_cmdline)
-            .root_verity(true)
-            .hotplug_off(vm_config.hotplug_off)
-            .maybe_two_pass_add_pages(vm_config.qemu_single_pass_add_pages)
-            .maybe_pic(vm_config.pic)
-            .maybe_qemu_version(vm_config.qemu_version.clone())
-            .maybe_pci_hole64_size(if vm_config.pci_hole64_size > 0 {
-                Some(vm_config.pci_hole64_size)
-            } else {
-                None
-            })
-            .hugepages(vm_config.hugepages)
-            .num_gpus(vm_config.num_gpus)
-            .num_nvswitches(vm_config.num_nvswitches)
-            .build()
-            .measure()
-            .context("Failed to compute expected MRs")?;
-
-        let expected_mrs: Mrs = Mrs {
-            mrtd: hex::encode(&mrs.mrtd),
-            rtmr0: hex::encode(&mrs.rtmr0),
-            rtmr1: hex::encode(&mrs.rtmr1),
-            rtmr2: hex::encode(&mrs.rtmr2),
-        };
-        self.cache_mrs(&cache_key, &expected_mrs)
-            .context("Failed to cache MRs")?;
-        expected_mrs
-            .assert_eq(&verified_mrs)
-            .context("MRs do not match")?;
         Ok(())
     }
 
@@ -525,8 +418,10 @@ impl KmsRpc for RpcHandler {
         self.ensure_admin(&request.token)?;
         self.remove_cache(&self.image_cache_dir(), &request.image_hash)
             .context("Failed to clear image cache")?;
-        self.remove_cache(&self.mr_cache_dir(), &request.config_hash)
-            .context("Failed to clear MR cache")?;
+        // Clear measurement cache (now handled by verifier's cache in measurements/ dir)
+        let mr_cache_dir = self.state.config.image.cache_dir.join("measurements");
+        self.remove_cache(&mr_cache_dir, &request.config_hash)
+            .context("Failed to clear measurement cache")?;
         Ok(())
     }
 }

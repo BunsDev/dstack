@@ -12,6 +12,9 @@
 mod types;
 mod verification;
 
+// Re-export TdxMeasurements from dstack-mr for convenience
+pub use dstack_mr::TdxMeasurements;
+
 pub use types::{
     AcpiTables, ErrorResponse, RtmrEventEntry, RtmrEventStatus, RtmrMismatch, VerificationDetails,
     VerificationRequest, VerificationResponse,

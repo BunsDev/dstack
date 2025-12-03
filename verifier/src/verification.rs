@@ -124,6 +124,13 @@ struct CachedMeasurement {
     measurements: TdxMeasurements,
 }
 
+struct ImagePaths {
+    fw_path: PathBuf,
+    kernel_path: PathBuf,
+    initrd_path: PathBuf,
+    kernel_cmdline: String,
+}
+
 pub struct CvmVerifier {
     pub image_cache_dir: String,
     pub download_url: String,
@@ -312,6 +319,65 @@ impl CvmVerifier {
         Ok(measurements)
     }
 
+    /// Helper method to ensure image is downloaded and return image paths
+    async fn ensure_image_downloaded(&self, vm_config: &VmConfig) -> Result<ImagePaths> {
+        let hex_os_image_hash = hex::encode(&vm_config.os_image_hash);
+
+        // Get image directory
+        let image_dir = Path::new(&self.image_cache_dir)
+            .join("images")
+            .join(&hex_os_image_hash);
+
+        let metadata_path = image_dir.join("metadata.json");
+        if !metadata_path.exists() {
+            info!("Image {hex_os_image_hash} not found, downloading");
+            tokio::time::timeout(
+                self.download_timeout,
+                self.download_image(&hex_os_image_hash, &image_dir),
+            )
+            .await
+            .context("Download image timeout")?
+            .with_context(|| format!("Failed to download image {hex_os_image_hash}"))?;
+        }
+
+        let image_info =
+            fs_err::read_to_string(metadata_path).context("Failed to read image metadata")?;
+        let image_info: dstack_types::ImageInfo =
+            serde_json::from_str(&image_info).context("Failed to parse image metadata")?;
+
+        let fw_path = image_dir.join(&image_info.bios);
+        let kernel_path = image_dir.join(&image_info.kernel);
+        let initrd_path = image_dir.join(&image_info.initrd);
+        let kernel_cmdline = image_info.cmdline + " initrd=initrd";
+
+        Ok(ImagePaths {
+            fw_path,
+            kernel_path,
+            initrd_path,
+            kernel_cmdline,
+        })
+    }
+
+    /// Compute expected TDX measurements for a given VM configuration.
+    ///
+    /// This method downloads the OS image if needed (using the configured cache),
+    /// then computes the expected MRTD and RTMRs based on the VM configuration.
+    /// Results are cached automatically.
+    pub async fn compute_measurements_for_config(
+        &self,
+        vm_config: &VmConfig,
+    ) -> Result<TdxMeasurements> {
+        let image_paths = self.ensure_image_downloaded(vm_config).await?;
+
+        self.load_or_compute_measurements(
+            vm_config,
+            &image_paths.fw_path,
+            &image_paths.kernel_path,
+            &image_paths.initrd_path,
+            &image_paths.kernel_cmdline,
+        )
+    }
+
     pub async fn verify(&self, request: &VerificationRequest) -> Result<VerificationResponse> {
         let quote = hex::decode(&request.quote).context("Failed to decode quote hex")?;
 
@@ -414,8 +480,6 @@ impl CvmVerifier {
         debug: bool,
         details: &mut VerificationDetails,
     ) -> Result<()> {
-        let hex_os_image_hash = hex::encode(&vm_config.os_image_hash);
-
         // Get boot info from attestation
         let report = attestation
             .report
@@ -431,35 +495,11 @@ impl CvmVerifier {
             rtmr2: report.rt_mr2.to_vec(),
         };
 
-        // Get image directory
-        let image_dir = Path::new(&self.image_cache_dir)
-            .join("images")
-            .join(&hex_os_image_hash);
-
-        let metadata_path = image_dir.join("metadata.json");
-        if !metadata_path.exists() {
-            info!("Image {} not found, downloading", hex_os_image_hash);
-            tokio::time::timeout(
-                self.download_timeout,
-                self.download_image(&hex_os_image_hash, &image_dir),
-            )
-            .await
-            .context("Download image timeout")?
-            .with_context(|| format!("Failed to download image {hex_os_image_hash}"))?;
-        }
-
-        let image_info =
-            fs_err::read_to_string(metadata_path).context("Failed to read image metadata")?;
-        let image_info: dstack_types::ImageInfo =
-            serde_json::from_str(&image_info).context("Failed to parse image metadata")?;
-
-        let fw_path = image_dir.join(&image_info.bios);
-        let kernel_path = image_dir.join(&image_info.kernel);
-        let initrd_path = image_dir.join(&image_info.initrd);
-        let kernel_cmdline = image_info.cmdline + " initrd=initrd";
-
-        // Use dstack-mr to compute expected MRs
+        // Compute expected measurements (reusing the public API)
         let (mrs, expected_logs) = if debug {
+            // For debug mode, we need detailed logs and ACPI tables
+            let image_paths = self.ensure_image_downloaded(vm_config).await?;
+
             let TdxMeasurementDetails {
                 measurements,
                 rtmr_logs,
@@ -467,10 +507,10 @@ impl CvmVerifier {
             } = self
                 .compute_measurement_details(
                     vm_config,
-                    &fw_path,
-                    &kernel_path,
-                    &initrd_path,
-                    &kernel_cmdline,
+                    &image_paths.fw_path,
+                    &image_paths.kernel_path,
+                    &image_paths.initrd_path,
+                    &image_paths.kernel_cmdline,
                 )
                 .context("Failed to compute expected measurements")?;
 
@@ -482,15 +522,11 @@ impl CvmVerifier {
 
             (measurements, Some(rtmr_logs))
         } else {
+            // For non-debug mode, reuse the public API with caching
             (
-                self.load_or_compute_measurements(
-                    vm_config,
-                    &fw_path,
-                    &kernel_path,
-                    &initrd_path,
-                    &kernel_cmdline,
-                )
-                .context("Failed to obtain expected measurements")?,
+                self.compute_measurements_for_config(vm_config)
+                    .await
+                    .context("Failed to compute expected measurements")?,
                 None,
             )
         };
