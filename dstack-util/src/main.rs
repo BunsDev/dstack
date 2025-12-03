@@ -192,6 +192,10 @@ struct RemoveOrphansArgs {
     /// path to the docker-compose.yaml file
     #[arg(short = 'f', long)]
     compose: String,
+
+    /// show what would be removed without actually removing
+    #[arg(short = 'n', long)]
+    dry_run: bool,
 }
 
 #[derive(Parser)]
@@ -748,7 +752,7 @@ fn cmd_vtpm_attest(args: VtpmAttestArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_remove_orphans(compose_file: impl AsRef<Path>) -> Result<()> {
+async fn cmd_remove_orphans(compose_file: impl AsRef<Path>, dry_run: bool) -> Result<()> {
     // Connect to Docker daemon
     let docker =
         Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
@@ -802,18 +806,22 @@ async fn cmd_remove_orphans(compose_file: impl AsRef<Path>) -> Result<()> {
             continue;
         };
 
-        println!("Removing orphaned container {service_name} {container_id}");
-        docker
-            .remove_container(
-                &container_id,
-                Some(RemoveContainerOptions {
-                    v: true,
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .with_context(|| format!("Failed to remove container {}", container_id))?;
+        if dry_run {
+            println!("would remove orphaned container {service_name} {container_id}");
+        } else {
+            println!("removing orphaned container {service_name} {container_id}");
+            docker
+                .remove_container(
+                    &container_id,
+                    Some(RemoveContainerOptions {
+                        v: true,
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .with_context(|| format!("Failed to remove container {}", container_id))?;
+        }
     }
 
     Ok(())
@@ -863,7 +871,7 @@ async fn main() -> Result<()> {
             cmd_notify_host(args).await?;
         }
         Commands::RemoveOrphans(args) => {
-            cmd_remove_orphans(args.compose).await?;
+            cmd_remove_orphans(args.compose, args.dry_run).await?;
         }
         Commands::VtpmAttest(args) => {
             cmd_vtpm_attest(args)?;
