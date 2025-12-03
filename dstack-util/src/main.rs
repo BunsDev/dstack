@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
-use bollard::container::{ListContainersOptions, RemoveContainerOptions};
-use bollard::Docker;
 use clap::{Parser, Subcommand};
 use dstack_types::{KeyProvider, KeyProviderKind};
 use fs_err as fs;
@@ -196,6 +194,14 @@ struct RemoveOrphansArgs {
     /// show what would be removed without actually removing
     #[arg(short = 'n', long)]
     dry_run: bool,
+
+    /// Offline mode: operate without Docker daemon by directly reading Docker data directory
+    #[arg(long)]
+    no_dockerd: bool,
+
+    /// Docker data root directory for offline mode (default: /var/lib/docker)
+    #[arg(short = 'd', long, default_value = "/var/lib/docker")]
+    docker_root: String,
 }
 
 #[derive(Parser)]
@@ -731,74 +737,6 @@ fn cmd_vtpm_attest(args: VtpmAttestArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_remove_orphans(compose_file: impl AsRef<Path>, dry_run: bool) -> Result<()> {
-    // Connect to Docker daemon
-    let docker =
-        Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
-
-    // Parse compose file to extract project name and service names
-    let compose_info = docker_compose::parse_docker_compose_file(&compose_file)?;
-    let project_name = compose_info.project_name;
-    let service_names = compose_info.service_names;
-
-    // List all containers
-    let options = ListContainersOptions::<String> {
-        all: true,
-        ..Default::default()
-    };
-
-    let containers = docker
-        .list_containers(Some(options))
-        .await
-        .context("Failed to list containers")?;
-
-    // Find and remove orphaned containers
-    for container in containers {
-        let Some(labels) = container.labels else {
-            continue;
-        };
-
-        // Check if container belongs to current project
-        let Some(container_project) = labels.get("com.docker.compose.project") else {
-            continue;
-        };
-
-        if container_project != &project_name {
-            continue;
-        }
-        // Check if service still exists in compose file
-        let Some(service_name) = labels.get("com.docker.compose.service") else {
-            continue;
-        };
-        if service_names.contains(service_name) {
-            continue;
-        }
-        // Service no longer exists in compose file, remove the container
-        let Some(container_id) = container.id else {
-            continue;
-        };
-
-        if dry_run {
-            println!("would remove orphaned container {service_name} {container_id}");
-        } else {
-            println!("removing orphaned container {service_name} {container_id}");
-            docker
-                .remove_container(
-                    &container_id,
-                    Some(RemoveContainerOptions {
-                        v: true,
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .with_context(|| format!("Failed to remove container {}", container_id))?;
-        }
-    }
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     {
@@ -843,7 +781,15 @@ async fn main() -> Result<()> {
             cmd_notify_host(args).await?;
         }
         Commands::RemoveOrphans(args) => {
-            cmd_remove_orphans(args.compose, args.dry_run).await?;
+            if args.no_dockerd {
+                docker_compose::remove_orphans_direct(
+                    args.compose,
+                    args.docker_root,
+                    args.dry_run,
+                )?;
+            } else {
+                docker_compose::remove_orphans(args.compose, args.dry_run).await?;
+            }
         }
         Commands::VtpmAttest(args) => {
             cmd_vtpm_attest(args)?;

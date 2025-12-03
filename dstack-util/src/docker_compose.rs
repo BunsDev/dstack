@@ -3,7 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
+use bollard::container::{ListContainersOptions, RemoveContainerOptions};
+use bollard::Docker;
 use fs_err as fs;
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -56,6 +60,201 @@ fn get_project_name(compose_file: impl AsRef<Path>) -> Result<String> {
         .to_string_lossy()
         .into_owned();
     Ok(project_name)
+}
+
+/// Remove orphaned containers using Docker daemon API
+pub async fn remove_orphans(compose_file: impl AsRef<Path>, dry_run: bool) -> Result<()> {
+    // Connect to Docker daemon
+    let docker =
+        Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
+
+    // Parse compose file to extract project name and service names
+    let compose_info = parse_docker_compose_file(&compose_file)?;
+    let project_name = compose_info.project_name;
+    let service_names = compose_info.service_names;
+
+    // List all containers
+    let options = ListContainersOptions::<String> {
+        all: true,
+        ..Default::default()
+    };
+
+    let containers = docker
+        .list_containers(Some(options))
+        .await
+        .context("Failed to list containers")?;
+
+    // Find and remove orphaned containers
+    for container in containers {
+        let Some(labels) = container.labels else {
+            continue;
+        };
+
+        // Check if container belongs to current project
+        let Some(container_project) = labels.get("com.docker.compose.project") else {
+            continue;
+        };
+
+        if container_project != &project_name {
+            continue;
+        }
+        // Check if service still exists in compose file
+        let Some(service_name) = labels.get("com.docker.compose.service") else {
+            continue;
+        };
+        if service_names.contains(service_name) {
+            continue;
+        }
+        // Service no longer exists in compose file, remove the container
+        let Some(container_id) = container.id else {
+            continue;
+        };
+
+        if dry_run {
+            println!("would remove orphaned container {service_name} {container_id}");
+        } else {
+            println!("removing orphaned container {service_name} {container_id}");
+            docker
+                .remove_container(
+                    &container_id,
+                    Some(RemoveContainerOptions {
+                        v: true,
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .with_context(|| format!("Failed to remove container {}", container_id))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Docker container config.v2.json structure
+#[derive(Deserialize)]
+struct ContainerConfig {
+    #[serde(rename = "Config")]
+    config: Option<ContainerConfigInner>,
+}
+
+#[derive(Deserialize)]
+struct ContainerConfigInner {
+    #[serde(rename = "Labels")]
+    labels: Option<HashMap<String, String>>,
+}
+
+/// Remove orphaned containers without requiring Docker daemon (offline mode)
+///
+/// This function directly reads Docker's data directory to find and remove
+/// orphaned containers. It should be run BEFORE dockerd starts to prevent
+/// orphaned containers from starting.
+pub fn remove_orphans_direct(
+    compose_file: impl AsRef<Path>,
+    docker_root: impl AsRef<Path>,
+    dry_run: bool,
+) -> Result<()> {
+    // Parse compose file to extract project name and service names
+    let compose_info = parse_docker_compose_file(&compose_file)?;
+    let project_name = &compose_info.project_name;
+    let service_names = &compose_info.service_names;
+
+    let containers_dir = docker_root.as_ref().join("containers");
+    if !containers_dir.exists() {
+        println!(
+            "Docker containers directory does not exist: {}",
+            containers_dir.display()
+        );
+        return Ok(());
+    }
+
+    // Iterate through all container directories
+    let entries = fs::read_dir(&containers_dir).with_context(|| {
+        format!(
+            "Failed to read containers directory: {}",
+            containers_dir.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.context("Failed to read directory entry")?;
+        let container_dir = entry.path();
+
+        if !container_dir.is_dir() {
+            continue;
+        }
+
+        let container_id = container_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Read config.v2.json
+        let config_path = container_dir.join("config.v2.json");
+        if !config_path.exists() {
+            continue;
+        }
+
+        let config_content = match fs::read_to_string(&config_path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Warning: Failed to read {}: {}", config_path.display(), e);
+                continue;
+            }
+        };
+
+        let config: ContainerConfig = match serde_json::from_str(&config_content) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("Warning: Failed to parse {}: {}", config_path.display(), e);
+                continue;
+            }
+        };
+
+        let Some(inner_config) = config.config else {
+            continue;
+        };
+
+        let Some(labels) = inner_config.labels else {
+            continue;
+        };
+
+        // Check if container belongs to current project
+        let Some(container_project) = labels.get("com.docker.compose.project") else {
+            continue;
+        };
+
+        if container_project != project_name {
+            continue;
+        }
+
+        // Check if service still exists in compose file
+        let Some(service_name) = labels.get("com.docker.compose.service") else {
+            continue;
+        };
+
+        if service_names.contains(service_name) {
+            continue;
+        }
+
+        // Service no longer exists in compose file, remove the container directory
+        let short_id = &container_id[..12.min(container_id.len())];
+
+        if dry_run {
+            println!("would remove orphaned container {service_name} {short_id}");
+        } else {
+            println!("removing orphaned container {service_name} {short_id}");
+            fs::remove_dir_all(&container_dir).with_context(|| {
+                format!(
+                    "Failed to remove container directory: {}",
+                    container_dir.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
