@@ -786,21 +786,41 @@ fn cmd_tpm_verify(args: TpmVerifyArgs) -> Result<()> {
     let tpm_quote: dstack_tpm::TpmQuote =
         serde_json::from_str(&quote_json).context("Failed to parse quote JSON")?;
 
-    println!("=== TPM Quote Verification ===");
+    println!("=== TPM Quote Verification (dcap-qvl architecture) ===");
     println!("Root CA: {:?}", args.root_ca);
     println!("Quote file: {:?}", args.quote);
     println!();
 
-    let result = dstack_tpm::verify_quote(&tpm_quote, &root_ca_pem)?;
+    // Step 1: Get collateral (certificates + CRLs)
+    println!("[Step 1] Fetching quote collateral (certificates + CRLs)...");
+    let collateral = dstack_tpm::get_collateral(&tpm_quote, &root_ca_pem)
+        .context("Failed to get collateral")?;
+    println!("  ✓ Collateral fetched: {} CRLs downloaded", collateral.crls.len());
+    println!();
 
+    // Step 2: Verify quote with conditional CRL checking
+    println!("[Step 2] Verifying quote (CRL verification if CRL DP present)...");
+    let result = dstack_tpm::verify_quote(&tpm_quote, &collateral)?;
+
+    println!();
     println!("=== Verification Result ===");
-    println!("  EK Certificate Chain: {}", if result.ek_verified { "✓ VERIFIED" } else { "✗ FAILED" });
+    println!("  AK Certificate Chain (webpki + CRL): {}", if result.ak_verified { "✓ VERIFIED" } else { "✗ FAILED" });
     println!("  Quote Signature: {}", if result.signature_verified { "✓ VERIFIED" } else { "✗ FAILED" });
     println!("  PCR Values: {}", if result.pcr_verified { "✓ VERIFIED" } else { "✗ FAILED" });
+    println!("  Qualifying Data: {}", if result.qualifying_data_verified { "✓ VERIFIED" } else { "✗ FAILED" });
+
+    if let Some(ref error_msg) = result.error_message {
+        println!("  Error: {}", error_msg);
+    }
     println!();
 
     if result.success() {
-        println!("🎉 VERIFICATION PASSED");
+        let crl_msg = if collateral.crls.is_empty() {
+            "(no CRLs available)"
+        } else {
+            &format!("(with {} CRL(s) verified)", collateral.crls.len())
+        };
+        println!("🎉 VERIFICATION PASSED {}", crl_msg);
         Ok(())
     } else {
         anyhow::bail!("Verification failed");

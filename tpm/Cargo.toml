@@ -26,6 +26,9 @@ x509-parser = "0.16"
 nom = "7.1"
 base64 = "0.22"
 
+# TPM 2.0 TSS ESAPI for low-level TPM operations
+tss-esapi = { version = "7.5", optional = true }
+
 # Certificate chain verification
 webpki = { version = "0.102", package = "rustls-webpki", features = ["alloc", "ring"], default-features = false }
 dcap-qvl-webpki = { version = "0.103", features = ["alloc", "ring"] }
@@ -36,3 +39,4 @@ reqwest = { version = "0.12", features = ["rustls-tls", "blocking"], optional = 
 [features]
 default = []
 crl-download = ["reqwest"]
+gcp-vtpm = ["tss-esapi"]  # GCP vTPM support with pre-provisioned AK

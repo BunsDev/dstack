@@ -973,3 +973,10 @@ pub use verify::{verify_quote, VerificationResult};
 
 #[cfg(feature = "crl-download")]
 pub use verify::get_collateral;
+
+// ==================== GCP vTPM Support ====================
+
+#[cfg(feature = "gcp-vtpm")]
+mod gcp_ak;
+#[cfg(feature = "gcp-vtpm")]
+pub use gcp_ak::{load_gcp_ak_rsa, gcp_nv_index};
