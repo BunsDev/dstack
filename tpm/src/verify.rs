@@ -11,15 +11,15 @@ use anyhow::{bail, Context, Result};
 use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
-use x509_parser::prelude::*;
+use tracing::{debug, info, warn};
+use x509_parser::{extensions::DistributionPointName, prelude::*};
 
 use crate::{PcrValue, TpmQuote};
 
 /// Result of TPM quote verification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationResult {
-    pub ek_verified: bool,
+    pub ak_verified: bool,
     pub signature_verified: bool,
     pub pcr_verified: bool,
     pub qualifying_data_verified: bool,
@@ -28,17 +28,46 @@ pub struct VerificationResult {
 
 impl VerificationResult {
     pub fn success(&self) -> bool {
-        self.ek_verified
+        self.ak_verified
             && self.signature_verified
             && self.pcr_verified
             && self.qualifying_data_verified
     }
 }
 
-/// Verify a TPM quote with full cryptographic verification
-pub fn verify_quote(quote: &TpmQuote, root_ca_pem: &str) -> Result<VerificationResult> {
+/// Verify a TPM quote with full cryptographic verification and conditional CRL checking
+///
+/// This is the second step of dcap-qvl architecture. Use `get_collateral()` first
+/// to fetch certificates and CRLs, then pass the collateral to this function.
+///
+/// # Arguments
+/// * `quote` - The TPM quote to verify
+/// * `collateral` - Quote collateral containing cert chain and CRLs (from `get_collateral()`)
+///
+/// # Verification Steps
+/// 1. Parse TPMS_ATTEST structure
+/// 2. Verify qualifying data matches
+/// 3. **Verify PCR selection in pcr_values matches TPMS_ATTEST**
+/// 4. Verify PCR digest matches computed digest
+/// 5. **Extract AK public key from AK certificate**
+/// 6. Verify RSA signature using AK public key from certificate
+/// 7. **Verify AK certificate chain with CRL checking (webpki) - CRL verified if present**
+///
+/// # Returns
+/// A `VerificationResult` containing the results of all verification steps
+///
+/// # Example
+/// ```ignore
+/// let collateral = get_collateral(&quote, root_ca_pem)?;
+/// let result = verify_quote(&quote, &collateral)?;
+/// assert!(result.success());
+/// ```
+pub fn verify_quote(
+    quote: &TpmQuote,
+    collateral: &crate::QuoteCollateral,
+) -> Result<VerificationResult> {
     let mut result = VerificationResult {
-        ek_verified: false,
+        ak_verified: false,
         signature_verified: false,
         pcr_verified: false,
         qualifying_data_verified: false,
@@ -65,7 +94,21 @@ pub fn verify_quote(quote: &TpmQuote, root_ca_pem: &str) -> Result<VerificationR
     }
     result.qualifying_data_verified = true;
 
-    // Step 3: Verify PCR digest in TPMS_ATTEST matches our PCR values
+    // Step 3: Verify PCR selection matches TPMS_ATTEST
+    debug!("parsing PCR selection from TPMS_ATTEST ({} bytes)", attest.attested_quote_info.pcr_select.len());
+    debug!("pcr_select hex: {}", hex::encode(&attest.attested_quote_info.pcr_select));
+    let attested_pcr_indices = parse_pcr_selection(&attest.attested_quote_info.pcr_select)?;
+    let provided_pcr_indices: Vec<u32> = quote.pcr_values.iter().map(|p| p.index).collect();
+
+    if attested_pcr_indices != provided_pcr_indices {
+        result.error_message = Some(format!(
+            "PCR selection mismatch: TPMS_ATTEST has {:?}, but pcr_values has {:?}",
+            attested_pcr_indices, provided_pcr_indices
+        ));
+        return Ok(result);
+    }
+
+    // Step 4: Verify PCR digest in TPMS_ATTEST matches our PCR values
     let computed_pcr_digest = compute_pcr_digest(&quote.pcr_values)?;
     if attest.attested_quote_info.pcr_digest != computed_pcr_digest {
         result.error_message = Some("PCR digest mismatch".to_string());
@@ -73,24 +116,148 @@ pub fn verify_quote(quote: &TpmQuote, root_ca_pem: &str) -> Result<VerificationR
     }
     result.pcr_verified = true;
 
-    // Step 4: Verify RSA signature of TPMS_ATTEST using AK public key
-    match verify_signature(&quote.message, &quote.signature, &quote.ak_public) {
-        Ok(true) => result.signature_verified = true,
-        Ok(false) => {
-            result.error_message = Some("signature verification failed".to_string());
-            return Ok(result);
+    // Step 5: Extract AK public key from certificate
+    let ak_public_key = match extract_ak_public_key_from_cert(&quote.ak_cert) {
+        Ok(key) => {
+            info!("extracted AK public key from certificate");
+            key
         }
         Err(e) => {
-            result.error_message = Some(format!("signature verification error: {e}"));
+            result.error_message = Some(format!("failed to extract AK public key from certificate: {}", e));
             return Ok(result);
+        }
+    };
+
+    // Step 6: Verify RSA signature of TPMS_ATTEST using AK public key from certificate
+    match verify_signature_with_key(&quote.message, &quote.signature, &ak_public_key) {
+        Ok(true) => result.signature_verified = true,
+        Ok(false) => {
+            warn!("signature verification failed, continuing to certificate chain verification");
+            result.error_message = Some("signature verification failed".to_string());
+            // DON'T return here - continue to check certificate chain
+        }
+        Err(e) => {
+            warn!("signature verification error: {}, continuing to certificate chain verification", e);
+            result.error_message = Some(format!("signature verification error: {e}"));
+            // DON'T return here - continue to check certificate chain
         }
     }
 
-    // Step 5: Verify EK certificate chain (requires reading from TPM)
-    // For now, we mark it as verified if root CA is provided and valid
-    result.ek_verified = verify_ek_chain_impl(root_ca_pem).unwrap_or(false);
+    // Step 7: Verify AK certificate chain with conditional CRL checking (webpki)
+    // Following dcap-qvl architecture: CRL verification is enforced when CRL DP is present
+    match verify_ak_chain_with_collateral(&quote.ak_cert, collateral) {
+        Ok(true) => result.ak_verified = true,
+        Ok(false) => {
+            result.error_message =
+                Some("AK certificate chain verification failed (webpki)".to_string());
+        }
+        Err(e) => {
+            result.error_message = Some(format!("AK certificate chain verification error: {}", e));
+        }
+    }
 
     Ok(result)
+}
+
+/// Get quote collateral - certificates and CRLs required for verification
+///
+/// This function implements the first step of dcap-qvl architecture:
+/// given a quote, extract and download all necessary certificates and CRLs.
+///
+/// # Architecture (dcap-qvl pattern)
+/// - **Step 1**: `get_collateral()` - Extract certificate chain info and download CRLs
+/// - **Step 2**: `verify()` - Verify quote with collateral and enforce CRL checking
+///
+/// # Process
+/// 1. Extract AK certificate from quote
+/// 2. Extract CRL URLs from AK certificate
+/// 3. Extract intermediate CA certificate URL (AIA extension)
+/// 4. Download intermediate CA certificate
+/// 5. Extract CRL URLs from intermediate CA
+/// 6. Download all CRLs (root CA, intermediate CA, AK cert)
+///
+/// # Arguments
+/// * `quote` - TPM quote containing AK certificate
+/// * `root_ca_pem` - Root CA certificate in PEM format (provided by user)
+///
+/// # Returns
+/// `QuoteCollateral` containing all certificates and CRLs
+///
+/// # Errors
+/// Returns error if:
+/// - AK certificate not present in quote
+/// - CRL download fails (when crl-download feature enabled)
+/// - Certificate parsing fails
+///
+/// # Feature Requirements
+/// - Requires `crl-download` feature for automatic CRL downloading
+/// - Without feature, URLs are logged but CRLs are not downloaded
+#[cfg(feature = "crl-download")]
+pub fn get_collateral(quote: &TpmQuote, root_ca_pem: &str) -> Result<crate::QuoteCollateral> {
+    use crate::QuoteCollateral;
+
+    info!("fetching quote collateral (cert chain + CRLs)");
+
+    // Step 1: Extract AK certificate (leaf cert) from quote
+    let ak_cert_der = &quote.ak_cert;
+    info!("AK certificate (leaf) found: {} bytes", ak_cert_der.len());
+
+    // Step 2: Download intermediate CA from AK's AIA extension
+    let intermediate_ca_url = extract_aia_ca_issuers(ak_cert_der)?
+        .ok_or_else(|| anyhow::anyhow!("no AIA CA Issuers URL in AK certificate"))?;
+    info!("downloading intermediate CA from: {}", intermediate_ca_url);
+    let intermediate_ca_der = download_cert(&intermediate_ca_url)?;
+    let intermediate_ca_pem = der_to_pem(&intermediate_ca_der, "CERTIFICATE")?;
+
+    // Step 3: Build cert chain (intermediate + root)
+    let cert_chain_pem = format!("{}{}", intermediate_ca_pem, root_ca_pem);
+    info!("cert chain built: intermediate + root CA");
+
+    // Step 4: Extract CRL URLs from all certs
+    // Use pem crate to parse root CA (handles multi-line base64 correctly)
+    let root_ca_certs = extract_certs_webpki(root_ca_pem.as_bytes())?;
+    if root_ca_certs.is_empty() {
+        bail!("failed to parse root CA PEM - no certificates found");
+    }
+    let root_ca_der = root_ca_certs[0].as_ref();
+
+    let mut all_crl_urls = vec![];
+    all_crl_urls.push(("root", extract_crl_urls(root_ca_der)?));
+    all_crl_urls.push(("intermediate", extract_crl_urls(&intermediate_ca_der)?));
+    all_crl_urls.push(("ak", extract_crl_urls(ak_cert_der)?));
+
+    // Step 5: Download all CRLs in chain order
+    // CRL verification is conditional: only verify if CRL DP is present
+    info!("downloading CRLs (conditional: verify if CRL DP present)...");
+    let mut crls = Vec::new();
+
+    'outter: for (name, cert_crl_urls) in all_crl_urls {
+        if cert_crl_urls.is_empty() {
+            info!("  {name} cert has no CRL DP");
+            continue;
+        }
+        for url in cert_crl_urls {
+            match download_crl(&url) {
+                Ok(crl) => {
+                    info!("  {name} CRL: {} bytes", crl.len());
+                    crls.push(crl);
+                    continue 'outter;
+                }
+                Err(e) => {
+                    warn!("✗ failed to download CRL from {url}: {e:?}");
+                    continue;
+                }
+            };
+        }
+        bail!("failed to download CRL for {name}");
+    }
+
+    info!("✓ collateral fetched: {} CRLs downloaded", crls.len());
+
+    Ok(QuoteCollateral {
+        cert_chain_pem,
+        crls,
+    })
 }
 
 /// TPMS_ATTEST structure parsed
@@ -149,7 +316,29 @@ fn parse_tpms_attest(data: &[u8]) -> Result<TpmsAttest> {
         let (input, firmware_version) = be_u64(input)?;
 
         // Attested structure (TPMS_QUOTE_INFO for type TPM_ST_ATTEST_QUOTE = 0x8018)
-        let (input, pcr_select) = parse_sized_buffer(input)?;
+        // pcrSelect is TPML_PCR_SELECTION (not TPM2B, no size prefix)
+        // We need to parse it as raw data, so we'll extract it by parsing count first
+        let (input, pcr_select_count) = be_u32(input)?;
+
+        // For each TPMS_PCR_SELECTION, we need hash (2 bytes) + sizeofSelect (1 byte) + pcrSelect bytes
+        // Since we don't know the total size upfront, we'll parse each one
+        let mut pcr_select_data = Vec::new();
+        pcr_select_data.extend_from_slice(&pcr_select_count.to_be_bytes());
+
+        let mut current_input = input;
+        for _ in 0..pcr_select_count {
+            let (input, hash_alg) = be_u16(current_input)?;
+            let (input, sizeof_select) = be_u8(input)?;
+            let (input, pcr_bitmap) = take(sizeof_select)(input)?;
+
+            pcr_select_data.extend_from_slice(&hash_alg.to_be_bytes());
+            pcr_select_data.push(sizeof_select);
+            pcr_select_data.extend_from_slice(pcr_bitmap);
+
+            current_input = input;
+        }
+
+        let input = current_input;
         let (input, pcr_digest) = parse_sized_buffer(input)?;
 
         Ok((
@@ -167,7 +356,7 @@ fn parse_tpms_attest(data: &[u8]) -> Result<TpmsAttest> {
                 },
                 firmware_version,
                 attested_quote_info: QuoteInfo {
-                    pcr_select,
+                    pcr_select: pcr_select_data,
                     pcr_digest,
                 },
             },
@@ -189,6 +378,57 @@ fn parse_tpms_attest(data: &[u8]) -> Result<TpmsAttest> {
     Ok(attest)
 }
 
+/// Parse TPML_PCR_SELECTION to extract PCR indices
+///
+/// TPML_PCR_SELECTION structure (TPM 2.0 Part 2, Section 10.7.2):
+/// - count: UINT32 (4 bytes) - number of TPMS_PCR_SELECTION elements
+/// - For each TPMS_PCR_SELECTION:
+///   - hash: TPM_ALG_ID (2 bytes) - hash algorithm
+///   - sizeofSelect: UINT8 (1 byte) - size of pcrSelect in bytes (typically 3)
+///   - pcrSelect: BYTE[sizeofSelect] - PCR bitmap
+///
+/// Returns sorted list of PCR indices
+fn parse_pcr_selection(data: &[u8]) -> Result<Vec<u32>> {
+    use nom::bytes::complete::take;
+    use nom::number::complete::{be_u32, be_u16, be_u8};
+    use nom::IResult;
+
+    fn parse_selection(input: &[u8]) -> IResult<&[u8], Vec<u32>> {
+        let (input, count) = be_u32(input)?;
+
+        let mut all_pcrs = Vec::new();
+        let mut current_input = input;
+
+        for _ in 0..count {
+            let (input, _hash_alg) = be_u16(current_input)?;
+            let (input, sizeof_select) = be_u8(input)?;
+            let (input, pcr_bitmap) = take(sizeof_select)(input)?;
+
+            // Extract PCR indices from bitmap
+            for (byte_idx, &byte) in pcr_bitmap.iter().enumerate() {
+                for bit_idx in 0..8 {
+                    if (byte & (1 << bit_idx)) != 0 {
+                        let pcr_index = (byte_idx * 8 + bit_idx) as u32;
+                        all_pcrs.push(pcr_index);
+                    }
+                }
+            }
+
+            current_input = input;
+        }
+
+        Ok((current_input, all_pcrs))
+    }
+
+    let (_, mut pcr_indices) = parse_selection(data)
+        .map_err(|e| anyhow::anyhow!("failed to parse PCR selection: {e}"))?;
+
+    // Sort PCR indices for comparison
+    pcr_indices.sort_unstable();
+
+    Ok(pcr_indices)
+}
+
 /// Compute PCR digest from PCR values
 fn compute_pcr_digest(pcr_values: &[PcrValue]) -> Result<Vec<u8>> {
     let mut hasher = Sha256::new();
@@ -198,21 +438,96 @@ fn compute_pcr_digest(pcr_values: &[PcrValue]) -> Result<Vec<u8>> {
     Ok(hasher.finalize().to_vec())
 }
 
-/// Verify RSA signature using TPM2B_PUBLIC key
-fn verify_signature(message: &[u8], signature: &[u8], ak_public: &[u8]) -> Result<bool> {
-    // Parse TPM2B_PUBLIC structure to extract RSA public key
-    let public_key = parse_tpm2b_public(ak_public)?;
+/// Extract AK public key from AK certificate
+///
+/// This function extracts the RSA public key from the AK certificate in DER format.
+/// The AK certificate is signed by a trusted CA (e.g., Google Private CA on GCP).
+///
+/// # Arguments
+/// * `ak_cert_der` - AK certificate in DER format (from quote)
+///
+/// # Returns
+/// RSA public key extracted from the certificate
+fn extract_ak_public_key_from_cert(ak_cert_der: &[u8]) -> Result<RsaPublicKey> {
+    // Parse X.509 certificate
+    let (_, cert) = X509Certificate::from_der(ak_cert_der)
+        .context("failed to parse AK certificate")?;
 
-    // Hash the message first
+    // Extract SubjectPublicKeyInfo
+    let spki = cert.public_key();
+
+    // The subjectPublicKey is a BIT STRING containing RSAPublicKey DER encoding
+    // Use rsa crate's PKCS#1 decoder to parse it
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::traits::PublicKeyParts;
+
+    let public_key = RsaPublicKey::from_pkcs1_der(spki.subject_public_key.data.as_ref())
+        .context("failed to decode RSA public key from certificate")?;
+
+    info!("extracted AK public key from certificate ({} bits)", public_key.size() * 8);
+
+    Ok(public_key)
+}
+
+/// Verify RSA signature using RsaPublicKey
+///
+/// This function verifies the signature of the TPMS_ATTEST message using the provided
+/// RSA public key (extracted from AK certificate).
+fn verify_signature_with_key(message: &[u8], signature: &[u8], public_key: &RsaPublicKey) -> Result<bool> {
+    // Parse TPMT_SIGNATURE structure first to extract actual signature bytes
+    // quote.sig is not a raw signature, but TPMT_SIGNATURE structure:
+    // +0: sigAlg (2 bytes) - signature algorithm (0x0014 = TPM_ALG_RSASSA)
+    // +2: hash (2 bytes) - hash algorithm (0x000B = TPM_ALG_SHA256)
+    // +4: sig_size (2 bytes) - signature size (256 for RSA-2048)
+    // +6: signature (256 bytes) - actual RSA signature
+    if signature.len() < 6 {
+        bail!("signature too short: {} bytes", signature.len());
+    }
+
+    let sig_alg = u16::from_be_bytes([signature[0], signature[1]]);
+    let hash_alg = u16::from_be_bytes([signature[2], signature[3]]);
+    let sig_size = u16::from_be_bytes([signature[4], signature[5]]) as usize;
+
+    // Verify this is RSASSA with SHA256
+    if sig_alg != 0x0014 {
+        bail!("unsupported signature algorithm: 0x{:04x}", sig_alg);
+    }
+    if hash_alg != 0x000B {
+        bail!("unsupported hash algorithm: 0x{:04x}", hash_alg);
+    }
+
+    // Extract actual signature bytes (skip 6-byte header)
+    if signature.len() < 6 + sig_size {
+        bail!(
+            "signature length mismatch: expected {} + {} bytes, got {}",
+            6,
+            sig_size,
+            signature.len()
+        );
+    }
+    let actual_signature = &signature[6..6 + sig_size];
+
+    // Verify using PKCS#1 v1.5 signature scheme with SHA256
+    // TPM2 RSASSA signatures use standard PKCS#1 v1.5 padding with hash
+    // Reference: TPM 2.0 Library Spec Part 1, Section 18.2.3.6 (RSASSA)
+
+    info!("message ({} bytes): {}", message.len(), hex::encode(message));
+    info!("signature ({} bytes): {}", actual_signature.len(), hex::encode(actual_signature));
+
+    // Compute SHA256 hash of message
     let mut hasher = Sha256::new();
     hasher.update(message);
-    let digest = hasher.finalize();
+    let message_hash = hasher.finalize();
 
-    // Verify using PKCS#1 v1.5 signature scheme
-    // Use the padding scheme directly without type parameter
-    let padding = rsa::Pkcs1v15Sign::new_unprefixed();
-    match public_key.verify(padding, &digest, signature) {
-        Ok(_) => Ok(true),
+    info!("message hash: {}", hex::encode(&message_hash));
+
+    // Verify using PKCS#1 v1.5 with SHA256 hash
+    let padding = rsa::Pkcs1v15Sign::new::<Sha256>();
+    match public_key.verify(padding, &message_hash, actual_signature) {
+        Ok(_) => {
+            info!("✓ signature verification successful");
+            Ok(true)
+        }
         Err(e) => {
             warn!("signature verification failed: {}", e);
             Ok(false)
@@ -221,6 +536,10 @@ fn verify_signature(message: &[u8], signature: &[u8], ak_public: &[u8]) -> Resul
 }
 
 /// Parse TPM2B_PUBLIC structure to extract RSA public key
+///
+/// NOTE: This function is kept for reference but is no longer used.
+/// We now extract the public key directly from the AK certificate.
+#[allow(dead_code)]
 fn parse_tpm2b_public(data: &[u8]) -> Result<RsaPublicKey> {
     use nom::bytes::complete::take;
     use nom::number::complete::{be_u16, be_u32};
@@ -264,50 +583,378 @@ fn parse_tpm2b_public(data: &[u8]) -> Result<RsaPublicKey> {
     .context("invalid RSA public key")
 }
 
-/// Verify EK certificate chain against root CA
-fn verify_ek_chain_impl(root_ca_pem: &str) -> Result<bool> {
-    // Parse root CA certificate
-    let root_cert_pem = parse_pem(root_ca_pem.as_bytes())
-        .map_err(|e| anyhow::anyhow!("failed to parse root CA PEM: {e}"))?;
+//
+// ========== webpki-based certificate verification (with CRL support) ==========
+//
+// The following functions are adapted from dcap-qvl to provide industrial-strength
+// certificate chain verification with CRL revocation checking using the webpki library.
+//
 
-    let (_, root_cert) = X509Certificate::from_der(&root_cert_pem)
-        .map_err(|e| anyhow::anyhow!("failed to parse root CA: {e}"))?;
+/// Extract PEM certificates and convert to webpki CertificateDer format
+///
+/// This helper function parses PEM-encoded certificates and converts them to
+/// the DER format expected by webpki.
+fn extract_certs_webpki(cert_pem: &[u8]) -> Result<Vec<webpki::types::CertificateDer<'static>>> {
+    use ::pem::parse_many;
 
-    info!("root CA subject: {}", root_cert.subject());
-    info!("root CA issuer: {}", root_cert.issuer());
+    let pem_items =
+        parse_many(cert_pem).map_err(|e| anyhow::anyhow!("failed to parse PEM: {}", e))?;
 
-    // In production, we would:
-    // 1. Read EK certificate from TPM NV index (e.g., 0x01C00002)
-    // 2. Verify EK cert is signed by intermediate CA
-    // 3. Verify intermediate CA cert is signed by root CA
-    // 4. Verify AK is created under EK
+    let certs = pem_items
+        .into_iter()
+        .map(|pem| webpki::types::CertificateDer::from(pem.into_contents()))
+        .collect();
 
-    // For now, we just verify root CA parses correctly
-    // Full chain verification requires reading EK cert from TPM NV
-    Ok(true)
+    Ok(certs)
 }
 
-/// Parse PEM format and extract DER content
-fn parse_pem(input: &[u8]) -> Result<Vec<u8>, String> {
-    let s = std::str::from_utf8(input).map_err(|e| e.to_string())?;
+/// Verify AK certificate chain with collateral (conditional CRL checking)
+///
+/// This function implements webpki-based verification following dcap-qvl architecture.
+/// CRL verification is conditional: enforced if CRL Distribution Points are present in certs.
+///
+/// # Arguments
+/// * `ak_cert_der` - AK certificate in DER format (from quote)
+/// * `collateral` - Quote collateral containing cert chain and CRLs
+///
+/// # Returns
+/// `Ok(true)` if verification succeeds, `Ok(false)` if it fails
+fn verify_ak_chain_with_collateral(
+    ak_cert_der: &[u8],
+    collateral: &crate::QuoteCollateral,
+) -> Result<bool> {
+    use webpki::types::{CertificateDer, UnixTime};
+    use webpki::{BorrowedCertRevocationList, CertRevocationList, EndEntityCert};
 
-    // Find PEM boundaries
-    let begin = s.find("-----BEGIN").ok_or("no BEGIN marker found")?;
-    let end = s.find("-----END").ok_or("no END marker found")?;
+    info!(
+        "verifying AK certificate chain with webpki ({} bytes leaf, {} CRLs)",
+        ak_cert_der.len(),
+        collateral.crls.len()
+    );
 
-    // Extract base64 content between markers
-    let begin_end = s[begin..].find('\n').ok_or("invalid PEM format")?;
-    let base64_start = begin + begin_end + 1;
-    let base64_content = s[base64_start..end].trim();
+    // Parse leaf cert (AK certificate) as webpki EndEntityCert
+    let ak_cert_der_owned = CertificateDer::from(ak_cert_der.to_vec());
+    let ak_cert = EndEntityCert::try_from(&ak_cert_der_owned)
+        .map_err(|e| anyhow::anyhow!("failed to parse AK certificate: {:?}", e))?;
 
-    // Decode base64
-    base64_decode(base64_content)
+    // Parse cert chain (intermediate CAs + root CA)
+    let chain_certs = extract_certs_webpki(collateral.cert_chain_pem.as_bytes())?;
+    if chain_certs.is_empty() {
+        bail!("no certificates found in cert chain");
+    }
+
+    info!("loaded {} certificate(s) from chain", chain_certs.len());
+
+    // Last cert in chain is root CA (trust anchor)
+    let root_cert_der = chain_certs
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("empty cert chain"))?;
+    let trust_anchor = webpki::anchor_from_trusted_cert(root_cert_der)
+        .map_err(|e| anyhow::anyhow!("failed to create trust anchor from root CA: {:?}", e))?;
+
+    // All certs except last are intermediates
+    let intermediate_certs = if chain_certs.len() > 1 {
+        &chain_certs[..chain_certs.len() - 1]
+    } else {
+        &[]
+    };
+
+    info!(
+        "trust anchor created, {} intermediate(s)",
+        intermediate_certs.len()
+    );
+
+    // Get current time for validation
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("failed to get current time")?;
+    let time = UnixTime::since_unix_epoch(now);
+
+    // Create trust anchor array
+    let trust_anchors = [trust_anchor];
+
+    // Check root CA against CRL (if CRLs available)
+    // Because the original rustls-webpki doesn't check the ROOT CA against the CRL,
+    // we use dcap-qvl-webpki to check it separately (following dcap-qvl pattern)
+    if !collateral.crls.is_empty() {
+        info!("checking root CA against CRL (dcap-qvl-webpki)");
+        let crl_refs: Vec<&[u8]> = collateral.crls.iter().map(|c| c.as_slice()).collect();
+        dcap_qvl_webpki::check_single_cert_crl(root_cert_der.as_ref(), &crl_refs, time)?;
+        info!("✓ root CA CRL check passed");
+    }
+
+    // Parse CRLs and verify (conditional: only verify with CRL if CRLs are present)
+    // Following user guidance: CRL verification is required if CRL DP is present in certs
+    let result = if !collateral.crls.is_empty() {
+        info!(
+            "parsing {} CRL(s) for revocation checking",
+            collateral.crls.len()
+        );
+        let crls: Vec<CertRevocationList> = collateral
+            .crls
+            .iter()
+            .enumerate()
+            .map(|(i, der)| {
+                BorrowedCertRevocationList::from_der(der)
+                    .map(|crl| crl.into())
+                    .map_err(|e| anyhow::anyhow!("failed to parse CRL #{}: {:?}", i, e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let crl_refs: Vec<&CertRevocationList> = crls.iter().collect();
+
+        info!("creating revocation options (CRL enforcement)");
+        let revocation_builder = webpki::RevocationOptionsBuilder::new(&crl_refs)
+            .map_err(|_| anyhow::anyhow!("failed to create RevocationOptionsBuilder"))?;
+
+        // Following dcap-qvl: check entire chain, allow unknown status, enforce expiration
+        // Note: UnknownStatusPolicy::Allow is used because:
+        // - AK leaf cert has NO CRL DP (Intermediate CA doesn't publish CRL for AK certs)
+        // - Only Intermediate CA has CRL (signed by Root CA)
+        // - If cert has no CRL DP, we don't require revocation check for that cert
+        let revocation = revocation_builder
+            .with_depth(webpki::RevocationCheckDepth::Chain)
+            .with_status_policy(webpki::UnknownStatusPolicy::Allow)
+            .with_expiration_policy(webpki::ExpirationPolicy::Enforce)
+            .build();
+
+        info!("verifying certificate chain with CRL revocation checking");
+
+        // Verify with CRL checking
+        // TPM Attestation: Intermediate CA has EKU = tcg-kp-AIKCertificate (2.23.133.8.1)
+        // This is defined by TCG (Trusted Computing Group) for TPM AIK certificates
+        // AK leaf cert has no EKU, but intermediate CA does, so we must specify this
+        const TCG_KP_AIK_CERTIFICATE: &[u8] = &[0x67, 0x81, 0x05, 0x08, 0x01]; // OID 2.23.133.8.1
+        let key_usage = webpki::KeyUsage::required_if_present(TCG_KP_AIK_CERTIFICATE);
+
+        ak_cert
+            .verify_for_usage(
+                webpki::ALL_VERIFICATION_ALGS,
+                &trust_anchors,
+                intermediate_certs,
+                time,
+                key_usage,
+                Some(revocation),                // CRL checking
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("certificate chain verification failed: {:?}", e))
+    } else {
+        info!("no CRLs available (no certificates have CRL Distribution Points)");
+        info!("verifying certificate chain WITHOUT CRL checking");
+
+        // Verify without CRL checking
+        // TPM Attestation: use TCG AIK Certificate EKU
+        const TCG_KP_AIK_CERTIFICATE: &[u8] = &[0x67, 0x81, 0x05, 0x08, 0x01]; // OID 2.23.133.8.1
+        let key_usage = webpki::KeyUsage::required_if_present(TCG_KP_AIK_CERTIFICATE);
+
+        ak_cert
+            .verify_for_usage(
+                webpki::ALL_VERIFICATION_ALGS,
+                &trust_anchors,
+                intermediate_certs,
+                time,
+                key_usage,
+                None,                            // No CRL checking
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("certificate chain verification failed: {:?}", e))
+    };
+
+    match result {
+        Ok(_) => {
+            if collateral.crls.is_empty() {
+                info!("✓ AK certificate chain verification successful (webpki, no CRLs)");
+            } else {
+                info!(
+                    "✓ AK certificate chain verification successful (webpki + {} CRL(s))",
+                    collateral.crls.len()
+                );
+            }
+            Ok(true)
+        }
+        Err(e) => {
+            warn!("✗ AK certificate chain verification failed: {}", e);
+            Ok(false)
+        }
+    }
 }
 
-/// Decode base64 string
-fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+/// Download CRL from URL (requires crl-download feature)
+///
+/// This function downloads a CRL from the given URL using reqwest.
+/// It's used to fetch CRLs referenced in certificate CRL Distribution Points.
+#[cfg(feature = "crl-download")]
+#[allow(dead_code)]
+fn download_crl(url: &str) -> Result<Vec<u8>> {
+    info!("downloading CRL from {}", url);
+
+    let response =
+        reqwest::blocking::get(url).context(format!("failed to download CRL from {}", url))?;
+
+    if !response.status().is_success() {
+        bail!("CRL download failed with status: {}", response.status());
+    }
+
+    let crl_bytes = response
+        .bytes()
+        .context("failed to read CRL response body")?
+        .to_vec();
+
+    info!("downloaded {} bytes CRL from {}", crl_bytes.len(), url);
+
+    Ok(crl_bytes)
+}
+
+/// Extract CRL Distribution Points from X.509 certificate
+///
+/// Parses the CRL Distribution Points extension from a certificate to find
+/// CRL download URLs. These URLs can then be used with `download_crl()` to
+/// fetch the actual CRL data.
+///
+/// # Arguments
+/// * `cert_der` - Certificate in DER format
+///
+/// # Returns
+/// Vector of CRL URLs found in the certificate
+#[allow(dead_code)]
+fn extract_crl_urls(cert_der: &[u8]) -> Result<Vec<String>> {
+    use x509_parser::extensions::ParsedExtension;
+
+    let (_, cert) = X509Certificate::from_der(cert_der).context("failed to parse certificate")?;
+
+    let mut crl_urls = Vec::new();
+
+    // Look for CRL Distribution Points extension
+    for ext in cert.extensions() {
+        let ParsedExtension::CRLDistributionPoints(crl_dist_points) = ext.parsed_extension() else {
+            continue;
+        };
+        for dist_point in crl_dist_points.points.iter() {
+            let Some(dist_point_name) = &dist_point.distribution_point else {
+                continue;
+            };
+
+            let DistributionPointName::FullName(names) = dist_point_name else {
+                continue;
+            };
+            for name in names.iter() {
+                let x509_parser::extensions::GeneralName::URI(uri) = name else {
+                    continue;
+                };
+                crl_urls.push(uri.to_string());
+                debug!("found CRL URL: {uri}");
+            }
+        }
+    }
+
+    if crl_urls.is_empty() {
+        debug!("no CRL Distribution Points found in certificate");
+    }
+
+    Ok(crl_urls)
+}
+
+/// Extract Authority Information Access (AIA) CA Issuers URLs from X.509 certificate
+///
+/// Parses the AIA extension from a certificate to find the intermediate CA
+/// certificate download URL. This is used to automatically download the
+/// intermediate CA certificate referenced by the EK certificate.
+///
+/// # Arguments
+/// * `cert_der` - Certificate in DER format
+///
+/// # Returns
+/// First CA Issuers URL found in the certificate, or None if not present
+#[cfg(feature = "crl-download")]
+#[allow(dead_code)]
+fn extract_aia_ca_issuers(cert_der: &[u8]) -> Result<Option<String>> {
+    use x509_parser::extensions::ParsedExtension;
+
+    let (_, cert) = X509Certificate::from_der(cert_der).context("failed to parse certificate")?;
+
+    // Look for Authority Information Access extension
+    for ext in cert.extensions() {
+        let ParsedExtension::AuthorityInfoAccess(aia) = ext.parsed_extension() else {
+            continue;
+        };
+
+        for access_desc in &aia.accessdescs {
+            // Check if this is CA Issuers (OID 1.3.6.1.5.5.7.48.2)
+            const OID_CA_ISSUERS: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 48, 2];
+            let oid_bytes: Vec<u64> = match access_desc.access_method.iter() {
+                Some(iter) => iter.collect(),
+                None => continue,
+            };
+
+            if oid_bytes == OID_CA_ISSUERS {
+                // Extract URL from access location
+                if let x509_parser::extensions::GeneralName::URI(uri) = &access_desc.access_location
+                {
+                    info!("found AIA CA Issuers URL: {}", uri);
+                    return Ok(Some(uri.to_string()));
+                }
+            }
+        }
+    }
+
+    info!("no AIA CA Issuers URL found in certificate");
+    Ok(None)
+}
+
+/// Download certificate from URL (requires crl-download feature)
+///
+/// This function downloads a certificate from the given URL using reqwest.
+/// It's used to fetch intermediate CA certificates referenced in EK certificate AIA extension.
+#[cfg(feature = "crl-download")]
+#[allow(dead_code)]
+fn download_cert(url: &str) -> Result<Vec<u8>> {
+    info!("downloading certificate from {}", url);
+
+    let response = reqwest::blocking::get(url)
+        .context(format!("failed to download certificate from {}", url))?;
+
+    if !response.status().is_success() {
+        bail!(
+            "certificate download failed with status: {}",
+            response.status()
+        );
+    }
+
+    let cert_bytes = response
+        .bytes()
+        .context("failed to read certificate response body")?
+        .to_vec();
+
+    info!(
+        "downloaded {} bytes certificate from {}",
+        cert_bytes.len(),
+        url
+    );
+
+    Ok(cert_bytes)
+}
+
+/// Convert DER-encoded certificate to PEM format
+///
+/// # Arguments
+/// * `der` - Certificate in DER format
+/// * `label` - PEM label (e.g., "CERTIFICATE")
+///
+/// # Returns
+/// Certificate in PEM format
+#[cfg(feature = "crl-download")]
+#[allow(dead_code)]
+fn der_to_pem(der: &[u8], label: &str) -> Result<String> {
     use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(s.as_bytes())
-        .map_err(|e| e.to_string())
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+
+    // Format as PEM with 64-character lines
+    let mut pem = format!("-----BEGIN {}-----\n", label);
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk)?);
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {}-----\n", label));
+
+    Ok(pem)
 }

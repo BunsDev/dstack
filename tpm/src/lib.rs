@@ -42,16 +42,41 @@ pub struct TpmQuote {
     /// Quote signature by Attestation Key
     #[serde(with = "hex_bytes")]
     pub signature: Vec<u8>,
-    /// Attestation Key (AK) public key in TPM format
-    #[serde(with = "hex_bytes")]
-    pub ak_public: Vec<u8>,
     /// PCR values at the time of quote generation
     pub pcr_values: Vec<PcrValue>,
-    /// PCR selection used for the quote
-    pub pcr_selection: PcrSelection,
     /// Qualifying data (nonce) used in the quote
     #[serde(with = "hex_bytes")]
     pub qualifying_data: Vec<u8>,
+    /// Attestation Key (AK) certificate (DER format)
+    /// On GCP, this is stored in TPM NV index 0x01C10000 (RSA) or 0x01C10002 (ECC)
+    /// and is signed by Google Private CA (GCE Intermediate CA)
+    #[serde(with = "hex_bytes")]
+    pub ak_cert: Vec<u8>,
+}
+
+/// Quote collateral - certificates and CRLs required for verification
+///
+/// Following dcap-qvl architecture, this structure contains all the external
+/// data needed to verify a TPM quote certificate chain.
+///
+/// # Architecture (dcap-qvl pattern)
+/// - **Step 1**: `get_collateral()` - Extract cert chain and download CRLs (if CRL DP present)
+/// - **Step 2**: `verify_quote()` - Verify quote with collateral (CRL verification is conditional)
+///
+/// # Certificate Chain
+/// The TPM AK certificate chain follows this structure:
+/// - **Leaf cert**: AK (Attestation Key) certificate from TPM
+/// - **Cert chain**: Intermediate CA(s) + Root CA (PEM format, concatenated)
+/// - **CRLs**: Certificate Revocation Lists for all certs (DER format)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuoteCollateral {
+    /// Certificate chain in PEM format (intermediate CA(s) + root CA concatenated)
+    /// This serves as the trust anchor for verification
+    pub cert_chain_pem: String,
+    /// Certificate Revocation Lists in DER format (conditional)
+    /// Order: CRLs for certificates that have CRL Distribution Points
+    /// CRL verification is enforced only for certs that provide CRL DP
+    pub crls: Vec<Vec<u8>>,
 }
 
 /// PCR value for a specific PCR register
@@ -789,11 +814,7 @@ impl TpmContext {
         let ek_ctx = work_dir.join("ek.ctx");
         let ek_ctx_str = ek_ctx.to_string_lossy();
 
-        let Some(output) = self.run_cmd(
-            "tpm2_createek",
-            &["-c", &ek_ctx_str, "-G", "rsa"],
-        )?
-        else {
+        let Some(output) = self.run_cmd("tpm2_createek", &["-c", &ek_ctx_str, "-G", "rsa"])? else {
             bail!("tpm2_createek not found");
         };
         if !output.success {
@@ -857,32 +878,58 @@ impl TpmContext {
         // Read all the quote materials
         let message = std::fs::read(&quote_msg)?;
         let signature = std::fs::read(&quote_sig)?;
-        let ak_public = std::fs::read(&ak_pub)?;
+
+        // Read AK certificate from TPM NV (REQUIRED - must have pre-provisioned AK)
+        let ak_cert = self.read_ak_cert()?.context(
+            "AK certificate not found in TPM NV storage - TPM quote requires pre-provisioned AK certificate for trust chain verification"
+        )?;
 
         Ok(TpmQuote {
             message,
             signature,
-            ak_public,
             pcr_values,
-            pcr_selection: pcr_selection.clone(),
             qualifying_data: qualifying_data.to_vec(),
+            ak_cert,
         })
     }
 
-    // ==================== EK (Endorsement Key) Operations ====================
+    // ==================== AK (Attestation Key) Certificate Operations ====================
 
-    /// Read the Endorsement Key public part
-    pub fn read_ek_public(&self) -> Result<Option<Vec<u8>>> {
-        // Default EK persistent handle
-        let Some(output) = self.run_cmd("tpm2_readpublic", &["-c", "0x81010001", "-f", "pem"])?
-        else {
-            return Ok(None);
-        };
-        if !output.success {
-            warn!("tpm2_readpublic EK failed: {}", output.stderr_string());
-            return Ok(None);
+    /// Read the Attestation Key certificate from TPM NV
+    ///
+    /// On GCP vTPM, the AK certificate is stored in NV index:
+    /// - 0x01C10000 (RSA AK cert)
+    /// - 0x01C10002 (ECC AK cert)
+    ///
+    /// The AK certificate is signed by Google Private CA (GCE Intermediate CA)
+    /// which establishes the trust chain: Google Root CA → GCE Intermediate CA → AK
+    ///
+    /// Returns None if not available (e.g., on non-GCP TPMs or hardware TPMs without pre-provisioning).
+    pub fn read_ak_cert(&self) -> Result<Option<Vec<u8>>> {
+        // GCP vTPM AK certificate NV indices (from go-tpm-tools)
+        const AK_RSA_CERT_NV_INDEX: u32 = 0x01C10000;
+        const AK_ECC_CERT_NV_INDEX: u32 = 0x01C10002;
+
+        if let Some(cert) = self.nv_read(AK_RSA_CERT_NV_INDEX)? {
+            info!(
+                "read AK certificate from NV index 0x{:08x} ({} bytes)",
+                AK_RSA_CERT_NV_INDEX,
+                cert.len()
+            );
+            return Ok(Some(cert));
         }
-        Ok(Some(output.stdout))
+
+        if let Some(cert) = self.nv_read(AK_ECC_CERT_NV_INDEX)? {
+            info!(
+                "read AK certificate from NV index 0x{:08x} ({} bytes)",
+                AK_ECC_CERT_NV_INDEX,
+                cert.len()
+            );
+            return Ok(Some(cert));
+        }
+
+        warn!("AK certificate not found in TPM NV storage (expected on GCP vTPM)");
+        Ok(None)
     }
 }
 
@@ -919,8 +966,10 @@ mod tests {
     }
 }
 
-
 // ==================== Pure Rust Verification ====================
 
 mod verify;
 pub use verify::{verify_quote, VerificationResult};
+
+#[cfg(feature = "crl-download")]
+pub use verify::get_collateral;
