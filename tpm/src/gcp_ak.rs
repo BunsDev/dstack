@@ -26,6 +26,57 @@ pub mod gcp_nv_index {
     pub const AK_ECC_TEMPLATE: u32 = 0x01C10003;
 }
 
+/// Load GCP pre-provisioned ECC AK using tss-esapi
+///
+/// This function:
+/// 1. Reads the AK template from NV index 0x01C10003
+/// 2. Creates a primary key under Endorsement hierarchy with the template
+/// 3. TPM deterministically recreates the same key pair (same template + same parent)
+///
+/// # Parameters
+/// - `tcti_path`: Path to TPM device (e.g., "/dev/tpmrm0" or None for default)
+///
+/// # Returns
+/// - `Ok((TssContext, KeyHandle))` - TSS context and handle to the loaded AK
+/// - `Err(_)` - Failed to load AK (not on GCP vTPM, or access error)
+pub fn load_gcp_ak_ecc(tcti_path: Option<&str>) -> Result<(TssContext, KeyHandle)> {
+    info!("loading GCP pre-provisioned ECC AK with tss-esapi...");
+
+    // Create TSS context
+    use std::str::FromStr;
+    let tcti_str = tcti_path.unwrap_or("/dev/tpmrm0");
+    let device_path = tcti_str.trim_start_matches("device:");
+    let device_config =
+        DeviceConfig::from_str(device_path).context("failed to parse device config")?;
+    let tcti = TctiNameConf::Device(device_config);
+    let mut context = TssContext::new(tcti).context("failed to create TSS context")?;
+
+    // Read AK template from NV
+    let template_bytes = read_nv_data(&mut context, gcp_nv_index::AK_ECC_TEMPLATE)
+        .context("failed to read ECC AK template from NV 0x01C10003")?;
+
+    info!(
+        "read ECC AK template from NV: {} bytes",
+        template_bytes.len()
+    );
+
+    // Parse template as TPM2B_PUBLIC
+    let public = Public::unmarshall(&template_bytes)
+        .context("failed to parse ECC AK template as TPM2B_PUBLIC")?;
+
+    // Create primary key under Endorsement hierarchy with null auth session
+    let ak_handle = context
+        .execute_with_nullauth_session(|ctx| {
+            ctx.create_primary(Hierarchy::Endorsement, public, None, None, None, None)
+        })
+        .context("failed to create primary ECC AK")?
+        .key_handle;
+
+    info!("✓ successfully loaded GCP pre-provisioned ECC AK (handle: {ak_handle:?})");
+
+    Ok((context, ak_handle))
+}
+
 /// Load GCP pre-provisioned RSA AK using tss-esapi
 ///
 /// This function:
@@ -83,10 +134,33 @@ pub fn load_gcp_ak_rsa(tcti_path: Option<&str>) -> Result<(TssContext, KeyHandle
     Ok((context, ak_handle))
 }
 
-/// Generate a TPM quote using GCP pre-provisioned AK
+/// Key algorithm preference for quote generation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAlgorithm {
+    /// Prefer ECC, fallback to RSA
+    Auto,
+    /// Use ECC only (fails if not available)
+    Ecc,
+    /// Use RSA only (fails if not available)
+    Rsa,
+}
+
+impl KeyAlgorithm {
+    /// Parse from string ("auto", "ecc", or "rsa")
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(KeyAlgorithm::Auto),
+            "ecc" | "ecdsa" => Ok(KeyAlgorithm::Ecc),
+            "rsa" | "rsassa" => Ok(KeyAlgorithm::Rsa),
+            _ => anyhow::bail!("invalid key algorithm: {s}. Use 'auto', 'ecc', or 'rsa'"),
+        }
+    }
+}
+
+/// Generate a TPM quote using GCP pre-provisioned AK (prefers ECC)
 ///
 /// This function:
-/// 1. Loads the GCP pre-provisioned RSA AK
+/// 1. Loads the GCP pre-provisioned AK (tries ECC first, then falls back to RSA)
 /// 2. Reads the specified PCR values
 /// 3. Generates a quote signed by the AK
 /// 4. Reads the AK certificate from NV
@@ -105,14 +179,71 @@ pub fn create_quote_with_gcp_ak(
     qualifying_data: &[u8],
     pcr_selection: &crate::PcrSelection,
 ) -> Result<crate::TpmQuote> {
+    create_quote_with_gcp_ak_algo(
+        tcti_path,
+        qualifying_data,
+        pcr_selection,
+        KeyAlgorithm::Auto,
+    )
+}
+
+/// Generate a TPM quote using GCP pre-provisioned AK with manual algorithm selection
+///
+/// This function allows specifying which key algorithm to use (ECC, RSA, or Auto).
+///
+/// # Parameters
+/// - `tcti_path`: Path to TPM device (e.g., "/dev/tpmrm0" or None for default)
+/// - `qualifying_data`: Nonce/challenge data to include in quote
+/// - `pcr_selection`: PCR registers to include in quote
+/// - `key_algo`: Key algorithm preference (Auto, Ecc, or Rsa)
+///
+/// # Returns
+/// - `Ok(TpmQuote)` - Complete quote with signature and certificate
+/// - `Err(_)` - Failed to generate quote
+pub fn create_quote_with_gcp_ak_algo(
+    tcti_path: Option<&str>,
+    qualifying_data: &[u8],
+    pcr_selection: &crate::PcrSelection,
+    key_algo: KeyAlgorithm,
+) -> Result<crate::TpmQuote> {
     use tss_esapi::interface_types::algorithm::HashingAlgorithm;
     use tss_esapi::structures::{Data, PcrSelectionListBuilder, PcrSlot, SignatureScheme};
     use tss_esapi::traits::Marshall;
 
     info!("generating TPM quote with GCP pre-provisioned AK...");
 
-    // Load GCP pre-provisioned AK
-    let (mut context, ak_handle) = load_gcp_ak_rsa(tcti_path)?;
+    // Load GCP pre-provisioned AK based on algorithm preference
+    let (mut context, ak_handle, ak_cert_nv_index) = match key_algo {
+        KeyAlgorithm::Auto => {
+            // Try ECC first (better performance), fallback to RSA
+            match load_gcp_ak_ecc(tcti_path) {
+                Ok((ctx, handle)) => {
+                    info!("✓ using ECC AK for quote");
+                    (ctx, handle, gcp_nv_index::AK_ECC_CERT)
+                }
+                Err(e) => {
+                    info!("ECC AK not available, falling back to RSA: {}", e);
+                    let (ctx, handle) = load_gcp_ak_rsa(tcti_path)?;
+                    info!("✓ using RSA AK for quote");
+                    (ctx, handle, gcp_nv_index::AK_RSA_CERT)
+                }
+            }
+        }
+        KeyAlgorithm::Ecc => {
+            // Use ECC only
+            let (ctx, handle) = load_gcp_ak_ecc(tcti_path).context(
+                "failed to load ECC AK (use --key-algo=rsa or --key-algo=auto for fallback)",
+            )?;
+            info!("✓ using ECC AK for quote");
+            (ctx, handle, gcp_nv_index::AK_ECC_CERT)
+        }
+        KeyAlgorithm::Rsa => {
+            // Use RSA only
+            let (ctx, handle) = load_gcp_ak_rsa(tcti_path).context("failed to load RSA AK")?;
+            info!("✓ using RSA AK for quote");
+            (ctx, handle, gcp_nv_index::AK_RSA_CERT)
+        }
+    };
 
     // Build PCR selection list for tss-esapi
     let mut pcr_selection_list = PcrSelectionListBuilder::new();
@@ -195,11 +326,15 @@ pub fn create_quote_with_gcp_ak(
         }
     }
 
-    // Read AK certificate from NV
-    let ak_cert = read_nv_data(&mut context, gcp_nv_index::AK_RSA_CERT)
+    // Read AK certificate from NV (ECC or RSA depending on which was loaded)
+    let ak_cert = read_nv_data(&mut context, ak_cert_nv_index)
         .context("failed to read AK certificate from NV")?;
 
-    info!("✓ AK certificate read from NV: {} bytes", ak_cert.len());
+    info!(
+        "✓ AK certificate read from NV 0x{:08x}: {} bytes",
+        ak_cert_nv_index,
+        ak_cert.len()
+    );
 
     Ok(crate::TpmQuote {
         message,

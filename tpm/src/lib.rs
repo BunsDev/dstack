@@ -266,7 +266,10 @@ impl TpmContext {
 
     /// Dump PCR values to log for debugging
     pub fn dump_pcr_values(&self, selection: &PcrSelection) {
-        match self.create_esapi_context().and_then(|mut ctx| ctx.pcr_read(selection)) {
+        match self
+            .create_esapi_context()
+            .and_then(|mut ctx| ctx.pcr_read(selection))
+        {
             Ok(values) => {
                 info!("PCR values ({}):", selection.to_arg());
                 for pv in values {
@@ -372,8 +375,24 @@ impl TpmContext {
         qualifying_data: &[u8],
         pcr_selection: &PcrSelection,
     ) -> Result<TpmQuote> {
-        // Use GCP AK implementation
+        // Use GCP AK implementation (auto-select ECC/RSA)
         gcp_ak::create_quote_with_gcp_ak(Some(&self.tcti), qualifying_data, pcr_selection)
+    }
+
+    /// Generate a TPM quote with manual key algorithm selection
+    pub fn create_quote_with_algo(
+        &self,
+        qualifying_data: &[u8],
+        pcr_selection: &PcrSelection,
+        key_algo: KeyAlgorithm,
+    ) -> Result<TpmQuote> {
+        // Use GCP AK implementation with specified algorithm
+        gcp_ak::create_quote_with_gcp_ak_algo(
+            Some(&self.tcti),
+            qualifying_data,
+            pcr_selection,
+            key_algo,
+        )
     }
 
     /// Read the Attestation Key certificate from TPM NV
@@ -467,12 +486,11 @@ mod tests {
         let attest_bytes = include_bytes!("../tests/tpm_quote_sample.bin");
 
         // Parse with tss-esapi (C library unmarshaller)
-        let esapi_attest = Attest::unmarshall(attest_bytes)
-            .expect("tss-esapi unmarshall failed");
+        let esapi_attest = Attest::unmarshall(attest_bytes).expect("tss-esapi unmarshall failed");
 
         // Parse with our nom parser
-        let nom_attest = crate::verify::parse_tpms_attest_for_test(attest_bytes)
-            .expect("nom parser failed");
+        let nom_attest =
+            crate::verify::parse_tpms_attest_for_test(attest_bytes).expect("nom parser failed");
 
         // Verify magic number matches
         assert_eq!(nom_attest.magic, 0xff544347, "magic number mismatch");
@@ -523,4 +541,7 @@ pub use verify::get_collateral;
 // ==================== GCP vTPM Support ====================
 
 mod gcp_ak;
-pub use gcp_ak::{create_quote_with_gcp_ak, gcp_nv_index, load_gcp_ak_rsa};
+pub use gcp_ak::{
+    create_quote_with_gcp_ak, create_quote_with_gcp_ak_algo, gcp_nv_index, load_gcp_ak_ecc,
+    load_gcp_ak_rsa, KeyAlgorithm,
+};

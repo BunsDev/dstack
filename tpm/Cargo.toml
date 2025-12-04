@@ -22,6 +22,7 @@ fs-err.workspace = true
 
 # Cryptographic verification
 rsa = "0.9"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 x509-parser = "0.16"
 nom = "7.1"
 base64 = "0.22"

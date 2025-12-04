@@ -8,6 +8,7 @@
 //! without relying on external command-line tools.
 
 use anyhow::{bail, Context, Result};
+use p256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,13 @@ use rustls_pki_types::{CertificateDer, UnixTime};
 use webpki::{BorrowedCertRevocationList, CertRevocationList, EndEntityCert};
 
 use crate::{PcrValue, TpmQuote};
+
+/// Public key type (RSA or ECC)
+#[derive(Debug)]
+enum PublicKey {
+    Rsa(RsaPublicKey),
+    Ecc(VerifyingKey),
+}
 
 /// Result of TPM quote verification
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,7 +61,7 @@ impl VerificationResult {
 /// 3. **Verify PCR selection in pcr_values matches TPMS_ATTEST**
 /// 4. Verify PCR digest matches computed digest
 /// 5. **Extract AK public key from AK certificate**
-/// 6. Verify RSA signature using AK public key from certificate
+/// 6. Verify signature (RSA or ECC) using AK public key from certificate
 /// 7. **Verify AK certificate chain with CRL checking (webpki) - CRL verified if present**
 ///
 /// # Returns
@@ -140,7 +148,7 @@ pub fn verify_quote(
         }
     };
 
-    // Step 6: Verify RSA signature of TPMS_ATTEST using AK public key from certificate
+    // Step 6: Verify signature (RSA or ECC) of TPMS_ATTEST using AK public key from certificate
     match verify_signature_with_key(&quote.message, &quote.signature, &ak_public_key) {
         Ok(true) => result.signature_verified = true,
         Ok(false) => {
@@ -391,6 +399,12 @@ fn parse_tpms_attest(data: &[u8]) -> Result<TpmsAttest> {
     Ok(attest)
 }
 
+/// Test helper: expose parse_tpms_attest for testing
+#[cfg(test)]
+pub(crate) fn parse_tpms_attest_for_test(data: &[u8]) -> Result<TpmsAttest> {
+    parse_tpms_attest(data)
+}
+
 /// Parse TPML_PCR_SELECTION to extract PCR indices
 ///
 /// TPML_PCR_SELECTION structure (TPM 2.0 Part 2, Section 10.7.2):
@@ -453,15 +467,15 @@ fn compute_pcr_digest(pcr_values: &[PcrValue]) -> Result<Vec<u8>> {
 
 /// Extract AK public key from AK certificate
 ///
-/// This function extracts the RSA public key from the AK certificate in DER format.
+/// This function extracts the public key (RSA or ECC) from the AK certificate in DER format.
 /// The AK certificate is signed by a trusted CA (e.g., Google Private CA on GCP).
 ///
 /// # Arguments
 /// * `ak_cert_der` - AK certificate in DER format (from quote)
 ///
 /// # Returns
-/// RSA public key extracted from the certificate
-fn extract_ak_public_key_from_cert(ak_cert_der: &[u8]) -> Result<RsaPublicKey> {
+/// Public key (RSA or ECC) extracted from the certificate
+fn extract_ak_public_key_from_cert(ak_cert_der: &[u8]) -> Result<PublicKey> {
     // Parse X.509 certificate
     let (_, cert) =
         X509Certificate::from_der(ak_cert_der).context("failed to parse AK certificate")?;
@@ -469,67 +483,91 @@ fn extract_ak_public_key_from_cert(ak_cert_der: &[u8]) -> Result<RsaPublicKey> {
     // Extract SubjectPublicKeyInfo
     let spki = cert.public_key();
 
-    // The subjectPublicKey is a BIT STRING containing RSAPublicKey DER encoding
-    // Use rsa crate's PKCS#1 decoder to parse it
-    use rsa::pkcs1::DecodeRsaPublicKey;
-    use rsa::traits::PublicKeyParts;
+    // Get algorithm OID
+    let algo_oid = &spki.algorithm.algorithm;
 
-    let public_key = RsaPublicKey::from_pkcs1_der(spki.subject_public_key.data.as_ref())
-        .context("failed to decode RSA public key from certificate")?;
+    // RSA: 1.2.840.113549.1.1.1
+    const OID_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
+    // ECC: 1.2.840.10045.2.1
+    const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
 
-    info!(
-        "extracted AK public key from certificate ({} bits)",
-        public_key.size() * 8
-    );
+    let oid_bytes: Vec<u64> = algo_oid
+        .iter()
+        .ok_or_else(|| anyhow::anyhow!("invalid OID"))?
+        .collect();
 
-    Ok(public_key)
+    if oid_bytes == OID_RSA_ENCRYPTION {
+        // Parse RSA public key
+        use rsa::pkcs1::DecodeRsaPublicKey;
+        use rsa::traits::PublicKeyParts;
+
+        let public_key = RsaPublicKey::from_pkcs1_der(spki.subject_public_key.data.as_ref())
+            .context("failed to decode RSA public key from certificate")?;
+
+        info!(
+            "extracted RSA AK public key from certificate ({} bits)",
+            public_key.size() * 8
+        );
+
+        Ok(PublicKey::Rsa(public_key))
+    } else if oid_bytes == OID_EC_PUBLIC_KEY {
+        // Parse ECC public key
+        // The subjectPublicKey for ECC is an uncompressed point (0x04 || x || y)
+        let public_key_bytes = spki.subject_public_key.data.as_ref();
+
+        let verifying_key = VerifyingKey::from_sec1_bytes(public_key_bytes)
+            .context("failed to decode ECC public key from certificate")?;
+
+        info!("extracted ECC P-256 AK public key from certificate");
+
+        Ok(PublicKey::Ecc(verifying_key))
+    } else {
+        bail!("unsupported public key algorithm: {:?}", oid_bytes);
+    }
 }
 
-/// Verify RSA signature using RsaPublicKey
+/// Verify signature using public key (RSA or ECC)
 ///
 /// This function verifies the signature of the TPMS_ATTEST message using the provided
-/// RSA public key (extracted from AK certificate).
+/// public key (RSA or ECC) extracted from AK certificate.
 fn verify_signature_with_key(
     message: &[u8],
     signature: &[u8],
-    public_key: &RsaPublicKey,
+    public_key: &PublicKey,
 ) -> Result<bool> {
-    // Parse TPMT_SIGNATURE structure first to extract actual signature bytes
-    // quote.sig is not a raw signature, but TPMT_SIGNATURE structure:
-    // +0: sigAlg (2 bytes) - signature algorithm (0x0014 = TPM_ALG_RSASSA)
-    // +2: hash (2 bytes) - hash algorithm (0x000B = TPM_ALG_SHA256)
-    // +4: sig_size (2 bytes) - signature size (256 for RSA-2048)
-    // +6: signature (256 bytes) - actual RSA signature
-    if signature.len() < 6 {
+    // Parse TPMT_SIGNATURE structure
+    // TPM 2.0 Part 2, Section 11.2.3 - TPMT_SIGNATURE
+    //
+    // Structure depends on sigAlg:
+    //
+    // For RSASSA (0x0014):
+    //   +0: sigAlg (2 bytes) = 0x0014
+    //   +2: signature: TPMS_SIGNATURE_RSASSA {
+    //         hash (2 bytes)
+    //         sig: TPM2B_PUBLIC_KEY_RSA (2 bytes size + N bytes signature)
+    //       }
+    //
+    // For ECDSA (0x0018):
+    //   +0: sigAlg (2 bytes) = 0x0018
+    //   +2: signature: TPMS_SIGNATURE_ECDSA {
+    //         hash (2 bytes)
+    //         signatureR: TPM2B_ECC_PARAMETER (2 bytes size + R bytes)
+    //         signatureS: TPM2B_ECC_PARAMETER (2 bytes size + S bytes)
+    //       }
+    if signature.len() < 4 {
         bail!("signature too short: {} bytes", signature.len());
     }
 
     let sig_alg = u16::from_be_bytes([signature[0], signature[1]]);
     let hash_alg = u16::from_be_bytes([signature[2], signature[3]]);
-    let sig_size = u16::from_be_bytes([signature[4], signature[5]]) as usize;
 
-    // Verify this is RSASSA with SHA256
-    if sig_alg != 0x0014 {
-        bail!("unsupported signature algorithm: 0x{:04x}", sig_alg);
-    }
+    // Verify hash algorithm is SHA256
     if hash_alg != 0x000B {
         bail!("unsupported hash algorithm: 0x{:04x}", hash_alg);
     }
 
-    // Extract actual signature bytes (skip 6-byte header)
-    if signature.len() < 6 + sig_size {
-        bail!(
-            "signature length mismatch: expected {} + {} bytes, got {}",
-            6,
-            sig_size,
-            signature.len()
-        );
-    }
-    let actual_signature = &signature[6..6 + sig_size];
-
-    // Verify using PKCS#1 v1.5 signature scheme with SHA256
-    // TPM2 RSASSA signatures use standard PKCS#1 v1.5 padding with hash
-    // Reference: TPM 2.0 Library Spec Part 1, Section 18.2.3.6 (RSASSA)
+    // Extract actual signature bytes (after sigAlg + hash)
+    let actual_signature = &signature[4..];
 
     info!(
         "message ({} bytes): {}",
@@ -549,16 +587,106 @@ fn verify_signature_with_key(
 
     info!("message hash: {}", hex::encode(message_hash));
 
-    // Verify using PKCS#1 v1.5 with SHA256 hash
-    let padding = rsa::Pkcs1v15Sign::new::<Sha256>();
-    match public_key.verify(padding, &message_hash, actual_signature) {
-        Ok(_) => {
-            info!("✓ signature verification successful");
-            Ok(true)
+    match public_key {
+        PublicKey::Rsa(rsa_key) => {
+            // Verify signature algorithm is RSASSA
+            if sig_alg != 0x0014 {
+                bail!("expected RSASSA (0x0014), got 0x{:04x}", sig_alg);
+            }
+
+            // Parse TPM2B_PUBLIC_KEY_RSA structure
+            // The actual_signature points to: [size (2 bytes)] [signature data]
+            if actual_signature.len() < 2 {
+                bail!("RSA signature too short for size field");
+            }
+            let rsa_sig_size =
+                u16::from_be_bytes([actual_signature[0], actual_signature[1]]) as usize;
+            if actual_signature.len() < 2 + rsa_sig_size {
+                bail!("RSA signature too short for signature data");
+            }
+            let rsa_sig_data = &actual_signature[2..2 + rsa_sig_size];
+
+            info!("RSA signature parsed: {} bytes", rsa_sig_size);
+
+            // Verify using PKCS#1 v1.5 signature scheme with SHA256
+            // TPM2 RSASSA signatures use standard PKCS#1 v1.5 padding with hash
+            // Reference: TPM 2.0 Library Spec Part 1, Section 18.2.3.6 (RSASSA)
+            let padding = rsa::Pkcs1v15Sign::new::<Sha256>();
+            match rsa_key.verify(padding, &message_hash, rsa_sig_data) {
+                Ok(_) => {
+                    info!("✓ RSA signature verification successful");
+                    Ok(true)
+                }
+                Err(e) => {
+                    warn!("RSA signature verification failed: {e}");
+                    Ok(false)
+                }
+            }
         }
-        Err(e) => {
-            warn!("signature verification failed: {}", e);
-            Ok(false)
+        PublicKey::Ecc(ecc_key) => {
+            // Verify signature algorithm is ECDSA
+            if sig_alg != 0x0018 {
+                bail!("expected ECDSA (0x0018), got 0x{sig_alg:04x}");
+            }
+
+            // Parse TPMS_SIGNATURE_ECDSA structure (TPM 2.0 Part 2, Section 11.2.3.2)
+            // After TPMT_SIGNATURE header, we have:
+            //   signatureR: TPM2B_ECC_PARAMETER (2 bytes size + r bytes)
+            //   signatureS: TPM2B_ECC_PARAMETER (2 bytes size + s bytes)
+            //
+            // But sig_size in TPMT_SIGNATURE only covers the first TPM2B (signatureR)!
+            // We need to parse both TPM2B structures to get r || s
+
+            // actual_signature points to: [signatureR (TPM2B)] [signatureS (TPM2B)] ...
+            // Parse signatureR
+            if actual_signature.len() < 2 {
+                bail!("ECDSA signature too short for signatureR size");
+            }
+            let r_size = u16::from_be_bytes([actual_signature[0], actual_signature[1]]) as usize;
+            if actual_signature.len() < 2 + r_size {
+                bail!("ECDSA signature too short for signatureR data");
+            }
+            let r_data = &actual_signature[2..2 + r_size];
+
+            // Parse signatureS
+            let s_offset = 2 + r_size;
+            if actual_signature.len() < s_offset + 2 {
+                bail!("ECDSA signature too short for signatureS size");
+            }
+            let s_size =
+                u16::from_be_bytes([actual_signature[s_offset], actual_signature[s_offset + 1]])
+                    as usize;
+            if actual_signature.len() < s_offset + 2 + s_size {
+                bail!("ECDSA signature too short for signatureS data");
+            }
+            let s_data = &actual_signature[s_offset + 2..s_offset + 2 + s_size];
+
+            // Concatenate r || s for p256 signature format
+            let mut sig_bytes = Vec::with_capacity(r_size + s_size);
+            sig_bytes.extend_from_slice(r_data);
+            sig_bytes.extend_from_slice(s_data);
+
+            info!(
+                "ECDSA signature parsed: r={} bytes, s={} bytes",
+                r_size, s_size
+            );
+
+            // Parse as ECDSA signature (r || s format)
+            let signature =
+                Signature::from_slice(&sig_bytes).context("failed to parse ECDSA signature")?;
+
+            // Verify ECDSA signature using prehash verifier
+            // TPM signs the SHA256 hash of the message, so we use verify_prehash
+            match ecc_key.verify_prehash(&message_hash, &signature) {
+                Ok(_) => {
+                    info!("✓ ECC signature verification successful");
+                    Ok(true)
+                }
+                Err(e) => {
+                    warn!("ECC signature verification failed: {e}");
+                    Ok(false)
+                }
+            }
         }
     }
 }

@@ -239,6 +239,10 @@ struct TpmQuoteArgs {
     /// output file (default: stdout)
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// key algorithm (auto, ecc, or rsa; default: auto)
+    #[arg(short = 'k', long, default_value = "auto")]
+    key_algo: String,
 }
 
 #[derive(Parser)]
@@ -758,13 +762,17 @@ fn cmd_tpm_quote(args: TpmQuoteArgs) -> Result<()> {
         }
         decoded
     } else {
-        vec![0u8; 32]  // TPM 2.0 max qualifying data is 32 bytes
+        vec![0u8; 32] // TPM 2.0 max qualifying data is 32 bytes
     };
+
+    // Parse key algorithm
+    let key_algo = dstack_tpm::KeyAlgorithm::from_str(&args.key_algo)
+        .context("Failed to parse key algorithm")?;
 
     let tpm = dstack_tpm::TpmContext::open(None).context("Failed to open TPM context")?;
     let pcr_selection = dstack_tpm::default_pcr_policy();
     let tpm_quote = tpm
-        .create_quote(&qualifying_data, &pcr_selection)
+        .create_quote_with_algo(&qualifying_data, &pcr_selection, key_algo)
         .context("Failed to create TPM quote")?;
 
     let quote_json =
@@ -793,9 +801,12 @@ fn cmd_tpm_verify(args: TpmVerifyArgs) -> Result<()> {
 
     // Step 1: Get collateral (certificates + CRLs)
     println!("[Step 1] Fetching quote collateral (certificates + CRLs)...");
-    let collateral = dstack_tpm::get_collateral(&tpm_quote, &root_ca_pem)
-        .context("Failed to get collateral")?;
-    println!("  ✓ Collateral fetched: {} CRLs downloaded", collateral.crls.len());
+    let collateral =
+        dstack_tpm::get_collateral(&tpm_quote, &root_ca_pem).context("Failed to get collateral")?;
+    println!(
+        "  ✓ Collateral fetched: {} CRLs downloaded",
+        collateral.crls.len()
+    );
     println!();
 
     // Step 2: Verify quote with conditional CRL checking
@@ -804,10 +815,38 @@ fn cmd_tpm_verify(args: TpmVerifyArgs) -> Result<()> {
 
     println!();
     println!("=== Verification Result ===");
-    println!("  AK Certificate Chain (webpki + CRL): {}", if result.ak_verified { "✓ VERIFIED" } else { "✗ FAILED" });
-    println!("  Quote Signature: {}", if result.signature_verified { "✓ VERIFIED" } else { "✗ FAILED" });
-    println!("  PCR Values: {}", if result.pcr_verified { "✓ VERIFIED" } else { "✗ FAILED" });
-    println!("  Qualifying Data: {}", if result.qualifying_data_verified { "✓ VERIFIED" } else { "✗ FAILED" });
+    println!(
+        "  AK Certificate Chain (webpki + CRL): {}",
+        if result.ak_verified {
+            "✓ VERIFIED"
+        } else {
+            "✗ FAILED"
+        }
+    );
+    println!(
+        "  Quote Signature: {}",
+        if result.signature_verified {
+            "✓ VERIFIED"
+        } else {
+            "✗ FAILED"
+        }
+    );
+    println!(
+        "  PCR Values: {}",
+        if result.pcr_verified {
+            "✓ VERIFIED"
+        } else {
+            "✗ FAILED"
+        }
+    );
+    println!(
+        "  Qualifying Data: {}",
+        if result.qualifying_data_verified {
+            "✓ VERIFIED"
+        } else {
+            "✗ FAILED"
+        }
+    );
 
     if let Some(ref error_msg) = result.error_message {
         println!("  Error: {}", error_msg);

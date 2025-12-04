@@ -2358,6 +2358,7 @@ dependencies = [
  "fs-err",
  "hex",
  "nom",
+ "p256",
  "pem",
  "reqwest",
  "rsa",
