@@ -3,24 +3,18 @@
 //! This module provides native Rust implementation for loading GCP's
 //! pre-provisioned Attestation Key using the TSS2 ESAPI.
 
-#[cfg(feature = "gcp-vtpm")]
 use anyhow::{Context as _, Result};
-#[cfg(feature = "gcp-vtpm")]
+use tracing::info;
 use tss_esapi::{
     handles::{KeyHandle, NvIndexTpmHandle, TpmHandle},
-    interface_types::{
-        resource_handles::{Hierarchy, NvAuth},
-    },
+    interface_types::resource_handles::{Hierarchy, NvAuth},
     structures::Public,
     tcti_ldr::{DeviceConfig, TctiNameConf},
     traits::UnMarshall,
     Context as TssContext,
 };
-#[cfg(feature = "gcp-vtpm")]
-use tracing::info;
 
 /// GCP vTPM NV indices for pre-provisioned AK
-#[cfg(feature = "gcp-vtpm")]
 pub mod gcp_nv_index {
     /// RSA AK certificate (DER format)
     pub const AK_RSA_CERT: u32 = 0x01C10000;
@@ -45,7 +39,6 @@ pub mod gcp_nv_index {
 /// # Returns
 /// - `Ok((TssContext, KeyHandle))` - TSS context and handle to the loaded AK
 /// - `Err(_)` - Failed to load AK (not on GCP vTPM, or access error)
-#[cfg(feature = "gcp-vtpm")]
 pub fn load_gcp_ak_rsa(tcti_path: Option<&str>) -> Result<(TssContext, KeyHandle)> {
     info!("loading GCP pre-provisioned RSA AK with tss-esapi...");
 
@@ -53,9 +46,9 @@ pub fn load_gcp_ak_rsa(tcti_path: Option<&str>) -> Result<(TssContext, KeyHandle
     use std::str::FromStr;
     // Strip "device:" prefix if present (from TpmContext tcti format)
     let tcti_str = tcti_path.unwrap_or("/dev/tpmrm0");
-    let device_path = tcti_str.strip_prefix("device:").unwrap_or(tcti_str);
-    let device_config = DeviceConfig::from_str(device_path)
-        .context("failed to parse device config")?;
+    let device_path = tcti_str.trim_start_matches("device:");
+    let device_config =
+        DeviceConfig::from_str(device_path).context("failed to parse device config")?;
     let tcti = TctiNameConf::Device(device_config);
     let mut context = TssContext::new(tcti).context("failed to create TSS context")?;
 
@@ -76,16 +69,16 @@ pub fn load_gcp_ak_rsa(tcti_path: Option<&str>) -> Result<(TssContext, KeyHandle
             ctx.create_primary(
                 Hierarchy::Endorsement,
                 public,
-                None,  // auth_value
-                None,  // sensitive_data
-                None,  // outside_info
-                None,  // creation_pcr
+                None, // auth_value
+                None, // sensitive_data
+                None, // outside_info
+                None, // creation_pcr
             )
         })
         .context("failed to create primary AK")?
         .key_handle;
 
-    info!("✓ successfully loaded GCP pre-provisioned AK (handle: {:?})", ak_handle);
+    info!("✓ successfully loaded GCP pre-provisioned AK (handle: {ak_handle:?})");
 
     Ok((context, ak_handle))
 }
@@ -107,14 +100,13 @@ pub fn load_gcp_ak_rsa(tcti_path: Option<&str>) -> Result<(TssContext, KeyHandle
 /// # Returns
 /// - `Ok(TpmQuote)` - Complete quote with signature and certificate
 /// - `Err(_)` - Failed to generate quote
-#[cfg(feature = "gcp-vtpm")]
 pub fn create_quote_with_gcp_ak(
     tcti_path: Option<&str>,
     qualifying_data: &[u8],
     pcr_selection: &crate::PcrSelection,
 ) -> Result<crate::TpmQuote> {
-    use tss_esapi::structures::{Data, PcrSelectionListBuilder, PcrSlot, SignatureScheme};
     use tss_esapi::interface_types::algorithm::HashingAlgorithm;
+    use tss_esapi::structures::{Data, PcrSelectionListBuilder, PcrSlot, SignatureScheme};
     use tss_esapi::traits::Marshall;
 
     info!("generating TPM quote with GCP pre-provisioned AK...");
@@ -139,16 +131,16 @@ pub fn create_quote_with_gcp_ak(
         let bit_mask = 1u32 << pcr_idx;
         let pcr_slot = PcrSlot::try_from(bit_mask)
             .with_context(|| format!("invalid PCR index: {}", pcr_idx))?;
-        pcr_selection_list = pcr_selection_list
-            .with_selection(hash_alg, &[pcr_slot]);
+        pcr_selection_list = pcr_selection_list.with_selection(hash_alg, &[pcr_slot]);
     }
 
-    let pcr_selection_list = pcr_selection_list.build()
+    let pcr_selection_list = pcr_selection_list
+        .build()
         .context("failed to build PCR selection list")?;
 
     // Create qualifying data structure
-    let qual_data = Data::try_from(qualifying_data.to_vec())
-        .context("failed to create qualifying data")?;
+    let qual_data =
+        Data::try_from(qualifying_data.to_vec()).context("failed to create qualifying data")?;
 
     // Use default signing scheme (RSASSA with SHA256)
     let signing_scheme = SignatureScheme::Null;
@@ -157,7 +149,12 @@ pub fn create_quote_with_gcp_ak(
     info!("calling TPM Quote command...");
     let (attest, signature) = context
         .execute_with_nullauth_session(|ctx| {
-            ctx.quote(ak_handle, qual_data, signing_scheme, pcr_selection_list.clone())
+            ctx.quote(
+                ak_handle,
+                qual_data,
+                signing_scheme,
+                pcr_selection_list.clone(),
+            )
         })
         .context("failed to generate quote")?;
 
@@ -167,7 +164,9 @@ pub fn create_quote_with_gcp_ak(
     let message = attest.marshall().context("failed to marshall attest")?;
 
     // Marshall signature to bytes (TPMT_SIGNATURE)
-    let signature = signature.marshall().context("failed to marshall signature")?;
+    let signature = signature
+        .marshall()
+        .context("failed to marshall signature")?;
 
     // Read PCR values - read each PCR individually to ensure correct mapping
     let mut pcr_values = Vec::new();
@@ -183,9 +182,7 @@ pub fn create_quote_with_gcp_ak(
             .context("failed to build single PCR selection")?;
 
         let (_update_counter, _pcr_sel_out, digest_list) = context
-            .execute_without_session(|ctx| {
-                ctx.pcr_read(single_pcr_sel)
-            })
+            .execute_without_session(|ctx| ctx.pcr_read(single_pcr_sel))
             .context("failed to read PCR value")?;
 
         // Get the first (and only) digest
@@ -214,13 +211,11 @@ pub fn create_quote_with_gcp_ak(
 }
 
 /// Read data from TPM NV index
-#[cfg(feature = "gcp-vtpm")]
 fn read_nv_data(context: &mut TssContext, nv_index: u32) -> Result<Vec<u8>> {
     use tss_esapi::abstraction::nv;
 
     // Create NV index TPM handle
-    let nv_idx = NvIndexTpmHandle::new(nv_index)
-        .context("invalid NV index")?;
+    let nv_idx = NvIndexTpmHandle::new(nv_index).context("invalid NV index")?;
 
     // Get NV index handle from TPM
     let nv_auth_handle = TpmHandle::NvIndex(nv_idx);

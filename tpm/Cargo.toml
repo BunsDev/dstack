@@ -37,6 +37,6 @@ reqwest = { version = "0.12", features = ["rustls-tls", "blocking"], optional = 
 
 
 [features]
-default = []
+default = ["gcp-vtpm"]  # Use tss-esapi by default
 crl-download = ["reqwest"]
-gcp-vtpm = ["tss-esapi"]  # GCP vTPM support with pre-provisioned AK
+gcp-vtpm = ["tss-esapi"]  # TPM operations via tss-esapi (GCP vTPM and general TPM support)
