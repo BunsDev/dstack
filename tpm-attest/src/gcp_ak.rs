@@ -3,6 +3,8 @@
 //! This module provides native Rust implementation for loading GCP's
 //! pre-provisioned Attestation Key using the TSS2 ESAPI.
 
+use std::str::FromStr;
+
 use anyhow::{Context as _, Result};
 use tracing::debug;
 use tss_esapi::{
@@ -145,9 +147,11 @@ pub enum KeyAlgorithm {
     Rsa,
 }
 
-impl KeyAlgorithm {
+impl FromStr for KeyAlgorithm {
+    type Err = anyhow::Error;
+
     /// Parse from string ("auto", "ecc", or "rsa")
-    pub fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "auto" => Ok(KeyAlgorithm::Auto),
             "ecc" | "ecdsa" => Ok(KeyAlgorithm::Ecc),

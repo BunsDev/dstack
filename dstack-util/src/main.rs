@@ -766,7 +766,9 @@ fn cmd_tpm_quote(args: TpmQuoteArgs) -> Result<()> {
     };
 
     // Parse key algorithm
-    let key_algo = tpm_attest::KeyAlgorithm::from_str(&args.key_algo)
+    let key_algo = args
+        .key_algo
+        .parse::<tpm_attest::KeyAlgorithm>()
         .context("Failed to parse key algorithm")?;
 
     let tpm = tpm_attest::TpmContext::open(None).context("Failed to open TPM context")?;
