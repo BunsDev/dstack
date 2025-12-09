@@ -77,6 +77,11 @@ fn measure_tdx_efi_variable(vendor_guid: &str, var_name: &str) -> Result<Vec<u8>
 }
 
 impl<'a> Tdvf<'a> {
+    /// Parse TDVF firmware metadata
+    ///
+    /// This function uses scale codec for clean, panic-free parsing.
+    /// Correctness is verified by integration test in tests/tdvf_parse.rs
+    /// which ensures identical measurements to the original implementation.
     pub fn parse(fw: &'a [u8]) -> Result<Tdvf<'a>> {
         const TDX_METADATA_OFFSET_GUID: &str = "e47a6535-984a-4798-865e-4685a7bf8ec2";
         const TABLE_FOOTER_GUID: &str = "96b582de-1fb2-45f7-baea-a366c55a082d";
