@@ -56,22 +56,17 @@ fn build_cert_chain(leaf_cert_der: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut current_cert_der = leaf_cert_der.to_vec();
 
     loop {
-        let aia_url = extract_aia_ca_issuers(&current_cert_der)?;
-        if aia_url.is_none() {
+        let Some(url) = extract_aia_ca_issuers(&current_cert_der)? else {
             debug!("no AIA found - reached end of AIA chain");
             break;
-        }
-
-        let url = aia_url.unwrap();
+        };
         debug!("downloading parent cert from: {url}");
         let parent_der = download_cert(&url)?;
-
         // Stop if we hit a self-signed cert (root CA)
         if is_self_signed(&parent_der)? {
             debug!("found self-signed cert - stopping (root CA should be provided by verifier)");
             break;
         }
-
         chain_ders.push(parent_der.clone());
         current_cert_der = parent_der;
     }

@@ -26,22 +26,30 @@ pub struct QuoteCollateral {
     pub root_ca_crl: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct VerificationResult {
+    pub status: VerificationStatus,
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for VerificationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "verification failed: {}", self.error)
+    }
+}
+
+impl std::error::Error for VerificationResult {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VerificationStatus {
     pub ak_verified: bool,
     pub signature_verified: bool,
     pub pcr_verified: bool,
     pub qualifying_data_verified: bool,
-    pub error_message: Option<String>,
-}
-
-impl VerificationResult {
-    pub fn success(&self) -> bool {
-        self.ak_verified
-            && self.signature_verified
-            && self.pcr_verified
-            && self.qualifying_data_verified
-    }
 }
 
 #[cfg(feature = "crl-download")]

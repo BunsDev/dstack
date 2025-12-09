@@ -4,19 +4,20 @@
 
 //! TPM Quote Verification Module
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use p256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 use rsa::RsaPublicKey;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 use x509_parser::prelude::*;
+use ::pem::parse_many;
 
 use rustls_pki_types::{CertificateDer, UnixTime};
 use webpki::{BorrowedCertRevocationList, CertRevocationList, EndEntityCert};
 
 use tpm_attest::{PcrValue, TpmQuote};
 
-use crate::{QuoteCollateral, VerificationResult};
+use crate::{QuoteCollateral, VerificationResult, VerificationStatus};
 
 #[derive(Debug)]
 enum PublicKey {
@@ -33,58 +34,61 @@ pub fn verify_quote(
     quote: &TpmQuote,
     collateral: &QuoteCollateral,
     root_ca_pem: &str,
-) -> Result<VerificationResult> {
-    let mut result = VerificationResult {
-        ak_verified: false,
-        signature_verified: false,
-        pcr_verified: false,
-        qualifying_data_verified: false,
-        error_message: None,
-    };
+) -> Result<(), VerificationResult> {
+    let mut status = VerificationStatus::default();
 
     let attest = match parse_tpms_attest(&quote.message) {
         Ok(a) => a,
         Err(e) => {
-            result.error_message = Some(format!("failed to parse TPMS_ATTEST: {e}"));
-            return Ok(result);
+            return Err(VerificationResult {
+                status,
+                error: e.context("failed to parse TPMS_ATTEST"),
+            });
         }
     };
 
     if attest.extra_data != quote.qualifying_data {
-        result.error_message = Some(format!(
-            "qualifying data mismatch: expected {} bytes, got {} bytes",
-            quote.qualifying_data.len(),
-            attest.extra_data.len()
-        ));
-        return Ok(result);
+        return Err(VerificationResult {
+            status,
+            error: anyhow!(
+                "qualifying data mismatch: expected {} bytes, got {} bytes",
+                quote.qualifying_data.len(),
+                attest.extra_data.len()
+            ),
+        });
     }
-    result.qualifying_data_verified = true;
+    status.qualifying_data_verified = true;
 
-    debug!(
-        "parsing PCR selection from TPMS_ATTEST ({} bytes)",
-        attest.attested_quote_info.pcr_select.len()
-    );
-    debug!(
-        "pcr_select hex: {}",
-        hex::encode(&attest.attested_quote_info.pcr_select)
-    );
-    let attested_pcr_indices = parse_pcr_selection(&attest.attested_quote_info.pcr_select)?;
+    let attested_pcr_indices = parse_pcr_selection(&attest.attested_quote_info.pcr_select)
+        .map_err(|error| VerificationResult {
+            status: status.clone(),
+            error,
+        })?;
     let provided_pcr_indices: Vec<u32> = quote.pcr_values.iter().map(|p| p.index).collect();
 
     if attested_pcr_indices != provided_pcr_indices {
-        result.error_message = Some(format!(
-            "PCR selection mismatch: TPMS_ATTEST has {:?}, but pcr_values has {:?}",
-            attested_pcr_indices, provided_pcr_indices
-        ));
-        return Ok(result);
+        return Err(VerificationResult {
+            status,
+            error: anyhow!(
+                "PCR selection mismatch: TPMS_ATTEST has {:?}, but pcr_values has {:?}",
+                attested_pcr_indices,
+                provided_pcr_indices
+            ),
+        });
     }
 
-    let computed_pcr_digest = compute_pcr_digest(&quote.pcr_values)?;
+    let computed_pcr_digest =
+        compute_pcr_digest(&quote.pcr_values).map_err(|e| VerificationResult {
+            status: status.clone(),
+            error: e,
+        })?;
     if attest.attested_quote_info.pcr_digest != computed_pcr_digest {
-        result.error_message = Some("PCR digest mismatch".to_string());
-        return Ok(result);
+        return Err(VerificationResult {
+            status,
+            error: anyhow!("PCR digest mismatch"),
+        });
     }
-    result.pcr_verified = true;
+    status.pcr_verified = true;
 
     let ak_public_key = match extract_ak_public_key_from_cert(&quote.ak_cert) {
         Ok(key) => {
@@ -92,39 +96,46 @@ pub fn verify_quote(
             key
         }
         Err(e) => {
-            result.error_message = Some(format!(
-                "failed to extract AK public key from certificate: {e}"
-            ));
-            return Ok(result);
+            return Err(VerificationResult {
+                status,
+                error: e.context("failed to extract AK public key from certificate"),
+            });
         }
     };
 
     match verify_signature_with_key(&quote.message, &quote.signature, &ak_public_key) {
-        Ok(true) => result.signature_verified = true,
+        Ok(true) => status.signature_verified = true,
         Ok(false) => {
-            warn!("signature verification failed, continuing to certificate chain verification");
-            result.error_message = Some("signature verification failed".to_string());
+            return Err(VerificationResult {
+                status,
+                error: anyhow!("signature verification failed"),
+            });
         }
         Err(e) => {
-            warn!(
-                "signature verification error: {e}, continuing to certificate chain verification"
-            );
-            result.error_message = Some(format!("signature verification error: {e}"));
+            return Err(VerificationResult {
+                status,
+                error: e.context("signature verification error"),
+            });
         }
     }
 
     match verify_ak_chain_with_collateral(&quote.ak_cert, collateral, root_ca_pem) {
-        Ok(true) => result.ak_verified = true,
+        Ok(true) => status.ak_verified = true,
         Ok(false) => {
-            result.error_message =
-                Some("AK certificate chain verification failed (webpki)".to_string());
+            return Err(VerificationResult {
+                status,
+                error: anyhow!("AK certificate chain verification failed"),
+            });
         }
         Err(e) => {
-            result.error_message = Some(format!("AK certificate chain verification error: {e}"));
+            return Err(VerificationResult {
+                status,
+                error: e.context("AK certificate chain verification error"),
+            });
         }
     }
 
-    Ok(result)
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -219,7 +230,7 @@ fn parse_tpms_attest(data: &[u8]) -> Result<TpmsAttest> {
         ))
     }
 
-    let (_, attest) = parse_attest(data).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+    let (_, attest) = parse_attest(data).map_err(|e| anyhow!("parse error: {e}"))?;
 
     if attest.magic != 0xff544347 {
         bail!("invalid magic number: 0x{magic:08x}", magic = attest.magic);
@@ -437,7 +448,6 @@ fn verify_signature_with_key(
 }
 
 fn extract_certs_webpki(cert_pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
-    use ::pem::parse_many;
 
     let pem_items = parse_many(cert_pem).context("failed to parse PEM")?;
 

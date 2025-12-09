@@ -816,66 +816,67 @@ fn cmd_tpm_verify(args: TpmVerifyArgs) -> Result<()> {
 
     // Step 2: Verify quote with conditional CRL checking
     println!("[Step 2] Verifying quote (CRL verification if CRL DP present)...");
-    let result = tpm_qvl::verify_quote(&tpm_quote, &collateral, &root_ca_pem)?;
 
-    println!();
-    println!("=== Verification Result ===");
-    println!(
-        "  AK Certificate Chain (webpki + CRL): {}",
-        if result.ak_verified {
-            "✓ VERIFIED"
-        } else {
-            "✗ FAILED"
-        }
-    );
-    println!(
-        "  Quote Signature: {}",
-        if result.signature_verified {
-            "✓ VERIFIED"
-        } else {
-            "✗ FAILED"
-        }
-    );
-    println!(
-        "  PCR Values: {}",
-        if result.pcr_verified {
-            "✓ VERIFIED"
-        } else {
-            "✗ FAILED"
-        }
-    );
-    println!(
-        "  Qualifying Data: {}",
-        if result.qualifying_data_verified {
-            "✓ VERIFIED"
-        } else {
-            "✗ FAILED"
-        }
-    );
-
-    if let Some(ref error_msg) = result.error_message {
-        println!("  Error: {}", error_msg);
-    }
-    println!();
-
-    if result.success() {
-        let crl_count = collateral.crls.len()
-            + if collateral.root_ca_crl.is_some() {
-                1
+    match tpm_qvl::verify_quote(&tpm_quote, &collateral, &root_ca_pem) {
+        Ok(()) => {
+            // Success - print simple success message
+            println!();
+            let crl_count = collateral.crls.len()
+                + if collateral.root_ca_crl.is_some() {
+                    1
+                } else {
+                    0
+                };
+            if crl_count == 0 {
+                println!("🎉 VERIFICATION PASSED (no CRLs available)");
             } else {
-                0
-            };
-        if crl_count == 0 {
-            println!("🎉 VERIFICATION PASSED (no CRLs available)");
-        } else {
-            println!(
-                "🎉 VERIFICATION PASSED (with {} CRL(s) verified)",
-                crl_count
-            );
+                println!(
+                    "🎉 VERIFICATION PASSED (with {} CRL(s) verified)",
+                    crl_count
+                );
+            }
+            Ok(())
         }
-        Ok(())
-    } else {
-        anyhow::bail!("Verification failed");
+        Err(verification_result) => {
+            // Failure - print detailed status
+            println!();
+            println!("=== Verification Result ===");
+            println!(
+                "  AK Certificate Chain (webpki + CRL): {}",
+                if verification_result.status.ak_verified {
+                    "✓ VERIFIED"
+                } else {
+                    "✗ FAILED"
+                }
+            );
+            println!(
+                "  Quote Signature: {}",
+                if verification_result.status.signature_verified {
+                    "✓ VERIFIED"
+                } else {
+                    "✗ FAILED"
+                }
+            );
+            println!(
+                "  PCR Values: {}",
+                if verification_result.status.pcr_verified {
+                    "✓ VERIFIED"
+                } else {
+                    "✗ FAILED"
+                }
+            );
+            println!(
+                "  Qualifying Data: {}",
+                if verification_result.status.qualifying_data_verified {
+                    "✓ VERIFIED"
+                } else {
+                    "✗ FAILED"
+                }
+            );
+            println!("  Error: {}", verification_result.error);
+            println!();
+            anyhow::bail!("Verification failed")
+        }
     }
 }
 
